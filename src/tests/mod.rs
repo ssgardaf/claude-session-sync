@@ -494,6 +494,16 @@ pub fn command_line(b: &Base, args: &[&str]) -> (i32, String) {
     (code, text)
 }
 
+/// As `command_line`, for the program that has no console window.
+pub fn command_line_windowless(b: &Base, args: &[&str]) -> (i32, String) {
+    let (mut con, shown) = crate::cli::Console::capture();
+    con.windowless = true;
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let code = crate::cli::run_with(&args, &b.env(), &con, &mut NoSystem);
+    let text = String::from_utf8_lossy(&shown.borrow()).into_owned();
+    (code, text)
+}
+
 /// A clock a test can move.
 #[derive(Clone)]
 pub struct FakeClock(Rc<std::cell::Cell<f64>>);

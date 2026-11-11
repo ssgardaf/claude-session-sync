@@ -17,8 +17,8 @@ fn no_command_is_a_preview() {
         parse(&[]).unwrap(),
         Args {
             command: Command::Preview { verbose: false },
-            days: 30,
-            delete_sync: false
+            days: None,
+            delete_sync: None
         }
     );
     assert_eq!(command(&["--verbose"]), Command::Preview { verbose: true });
@@ -57,8 +57,12 @@ fn every_command_is_recognised() {
     assert_eq!(
         command(&["resolve", "abcdef"]),
         Command::Resolve {
-            id: "abcdef".into()
+            id: Some("abcdef".into())
         }
+    );
+    assert_eq!(
+        command(&["resolve", "--all"]),
+        Command::Resolve { id: None }
     );
     assert_eq!(
         command(&["restore", "abcdef"]),
@@ -69,15 +73,15 @@ fn every_command_is_recognised() {
     assert_eq!(
         command(&["install"]),
         Command::Install {
-            interval: 3600,
-            quick: 10
+            interval: None,
+            quick: None
         }
     );
     assert_eq!(
         command(&["install", "--quick", "0"]),
         Command::Install {
-            interval: 3600,
-            quick: 0
+            interval: None,
+            quick: Some(0)
         }
     );
     assert_eq!(command(&["uninstall"]), Command::Uninstall { purge: false });
@@ -99,17 +103,39 @@ fn every_command_is_recognised() {
 
 #[test]
 fn common_options() {
-    for cmd in ["preview", "sync", "daemon", "status", "install"] {
-        let a = parse(&[cmd, "--days", "60", "--delete-sync"]).unwrap();
-        assert_eq!((a.days, a.delete_sync), (60, true), "{}", cmd);
+    for cmd in ["preview", "sync", "daemon", "status", "install", "resolve"] {
+        let mut args = vec![cmd, "--days", "60", "--delete-sync"];
+        if cmd == "resolve" {
+            args.push("--all");
+        }
+        let a = parse(&args).unwrap();
+        assert_eq!((a.days, a.delete_sync), (Some(60), Some(true)), "{}", cmd);
+        // it can be turned off as well as on; the last word counts
+        args.push("--no-delete-sync");
+        assert_eq!(parse(&args).unwrap().delete_sync, Some(false), "{}", cmd);
+        args.push("--delete-sync");
+        assert_eq!(parse(&args).unwrap().delete_sync, Some(true), "{}", cmd);
     }
     let a = parse(&["--delete-sync", "--days=7"]).unwrap();
     assert_eq!(
         (a.command, a.days, a.delete_sync),
-        (Command::Preview { verbose: false }, 7, true)
+        (Command::Preview { verbose: false }, Some(7), Some(true))
     );
+    // what is not given is not made up here: the installed settings (or the defaults) apply
     let a = parse(&["sync"]).unwrap();
-    assert_eq!((a.days, a.delete_sync), (30, false));
+    assert_eq!((a.days, a.delete_sync), (None, None));
+    let a = parse(&["install", "--interval", "600"]).unwrap();
+    assert_eq!(
+        (a.command, a.days, a.delete_sync),
+        (
+            Command::Install {
+                interval: Some(600),
+                quick: None
+            },
+            None,
+            None
+        )
+    );
 }
 
 #[test]
@@ -154,6 +180,10 @@ fn what_is_refused() {
         &["resolve"],
         &["restore"],
         &["resolve", "a", "b"],
+        &["resolve", "--all", "abcdef"],
+        &["restore", "--all"],
+        &["stop", "--no-delete-sync"],
+        &["preview", "--no-delete-sync=1"],
         &["preview", "--delete-sync=yes"],
         &["uninstall", "--delete-sync"],
         &["install", "--purge"],
@@ -209,6 +239,9 @@ fn help_names_every_command() {
         "--since",
         "--verbose",
         "--purge",
+        "--all",
+        "--no-delete-sync",
+        "settings.json",
         "-n N",
         "--version",
         "--help",

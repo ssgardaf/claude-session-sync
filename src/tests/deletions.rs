@@ -223,3 +223,75 @@ fn test_restore_brings_a_removed_session_back_everywhere() {
     assert_eq!((done.quarantine, done.add), (0, 1));
     assert!(b.has(A, "abcdef-1")); // back even where it was deleted
 }
+
+#[test]
+fn deletion_that_was_carried_over_and_undone_is_not_carried_over_again() {
+    let b = Base::new();
+    b.install(2.0 * HOUR, 0.0);
+    b.rec(B, "s1", r().cli("c1").last(HOUR));
+    fs::copy(b.path(B, "s1"), b.path(C, "s1")).unwrap(); // the same version in both
+    b.delete(A, "s1", 600.0, Some("c1"));
+    let start = now() - 1.0;
+    assert_eq!(b.s().run().quarantine, 2);
+    assert_eq!(b.s().undo(start).unwrap().put_back, 2);
+    assert!(b.has(B, "s1") && b.has(C, "s1"));
+    // A's own marker is still there, as the app left it; it does not take the session out again
+    assert!(b.dir(A).join("deleted_s1").exists());
+    for _ in 0..2 {
+        let mut s = b.s();
+        assert!(s.plan().acts.is_empty());
+        assert_eq!(s.run().sum(), 0);
+    }
+    assert!(b.has(B, "s1") && b.has(C, "s1"));
+    assert!(!b.has(A, "s1")); // (nor is it put back where it was deleted)
+    assert!(b.state()["exempt"]["s1"].as_f64().is_some());
+    // a deletion made after that is a new decision, and is carried over
+    b.rec(A, "s1", r().cli("c1").last(HOUR));
+    fs::remove_file(b.dir(A).join("deleted_s1")).unwrap();
+    fs::remove_file(b.dir(A).join("deleted_c1")).unwrap();
+    b.delete(A, "s1", 30.0, Some("c1"));
+    assert_eq!(b.s().run().quarantine, 2);
+    assert!(!b.has(B, "s1") && !b.has(C, "s1"));
+}
+
+#[test]
+fn record_that_vanished_is_not_put_back_at_once_by_a_new_process_either() {
+    let b = Base::new();
+    b.rec(A, "s1", r());
+    b.s().run(); // B and C hold copies this tool placed
+    fs::remove_file(b.path(B, "s1")).unwrap(); // the app is half-way through deleting it in B
+                                               // a new process (the daemon restarted, or a one-off sync): it cannot have seen the record
+                                               // go, but it knows it had placed it there, and that there is no marker
+    let mut s = b.s();
+    assert_eq!(s.plan().notes.just_removed, 1);
+    assert_eq!(s.run().add, 0);
+    assert!(!b.has(B, "s1"));
+    // and another one a little later: the five minutes run from the first notice, not anew
+    let mut s = b.s();
+    s.clock = Rc::new(|| now() + VANISH_GRACE_SEC - 60.0);
+    assert_eq!(s.run().add, 0);
+    let mut s = b.s();
+    s.clock = Rc::new(|| now() + VANISH_GRACE_SEC + 5.0);
+    assert_eq!(s.run().add, 1); // no marker ever came: it comes back
+    assert!(b.has(B, "s1"));
+    assert_eq!(b.s().run().sum(), 0);
+    assert!(b.state().get("vanished").is_none()); // nothing is kept on record longer than needed
+}
+
+#[test]
+fn record_that_vanished_and_then_got_its_marker_is_a_deletion_for_a_new_process_too() {
+    let b = Base::new();
+    b.install(2.0 * HOUR, 0.0);
+    b.rec(A, "s1", r());
+    b.s().run();
+    fs::remove_file(b.path(B, "s1")).unwrap();
+    assert_eq!(b.s().run().add, 0); // noticed by one process...
+    b.delete(B, "s1", 0.0, None); // ...the markers follow...
+    let done = b.s().run(); // ...and the next process carries the deletion over
+    assert_eq!((done.quarantine, done.add), (2, 0));
+    // a file that was never one of ours and is simply not there is a session to hand out
+    let b = Base::new();
+    b.rec(A, "s1", r());
+    assert_eq!(b.s().plan().notes.just_removed, 0);
+    assert_eq!(b.s().run().add, 2);
+}

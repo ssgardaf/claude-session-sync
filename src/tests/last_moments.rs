@@ -186,7 +186,7 @@ fn test_request_that_comes_in_gets_a_pass_and_is_not_lost_to_the_one_in_progress
 fn test_only_a_save_in_progress_keeps_the_hurry_up() {
     let b = Base::new();
     b.rec(A, "s1", r().last(600.0).mtime(300.0));
-    b.rec(B, "s1", r().last(HOUR).mtime(5.0)); // B's copy was written by the app 5 s ago: wait for it
+    b.rec(B, "s1", r().last(HOUR).mtime(2.0)); // B's copy was written by the app 2 s ago: wait for it
     let mut s = b.s();
     assert_eq!(s.run().deferred, 1);
     assert_eq!(s.settling, 0); // put off, but not on account of a save still settling
@@ -249,4 +249,79 @@ fn test_app_whose_program_folder_is_not_recognised_still_counts_as_running_while
     b.write_log(&["2026-11-11 09:00:00 [info] anything\r\n"]);
     s.app_seen = (0.0, false);
     assert!(s.app_running()); // the log was written just now
+}
+
+#[test]
+fn resolve_all_settles_every_conflict_there_is() {
+    let b = Base::new();
+    for fid in ["abcdef-1", "abcdef-2"] {
+        b.rec(
+            A,
+            fid,
+            r().last(3.0 * DAY)
+                .mtime(2.0 * DAY)
+                .archived()
+                .title("further along"),
+        );
+        b.rec(
+            B,
+            fid,
+            r().last(5.0 * DAY)
+                .mtime(DAY)
+                .title("older, un-archived later"),
+        );
+    }
+    b.rec(A, "plain", r());
+    assert_eq!(b.s().plan().notes.conflicts.len(), 2);
+    let asked = b.s().resolve_all().unwrap();
+    assert_eq!(
+        asked,
+        vec![String::from("abcdef-1"), String::from("abcdef-2")]
+    );
+    assert_eq!(b.s().run().update, 2); // the next pass
+    for fid in ["abcdef-1", "abcdef-2"] {
+        assert_eq!(b.title(B, fid), "further along");
+    }
+    assert_eq!(b.kept().len(), 2); // the versions that gave way are kept
+    b.s().run();
+    assert_eq!(asked_now(&b), json!({}));
+    // with nothing in conflict there is nothing to ask for, and nothing is written
+    let b = Base::new();
+    b.rec(A, "plain", r());
+    assert!(b.s().resolve_all().unwrap().is_empty());
+    assert!(!b.home.exists());
+}
+
+fn asked_now(b: &Base) -> serde_json::Value {
+    b.state()["resolve"].clone()
+}
+
+#[test]
+fn too_short_a_prefix_is_said_to_be_too_short() {
+    let b = Base::new();
+    conflict(&b, &[B]);
+    assert_eq!(b.s().resolve("abc").unwrap(), None);
+    assert_eq!(b.said("at least its first 6 characters"), 1);
+    assert_eq!(b.s().resolve("zzzzzzzz").unwrap(), None); // long enough, but no such session
+    assert_eq!(b.said("at least its first 6 characters"), 1);
+    assert_eq!(b.s().restore("abc").unwrap(), None);
+    assert_eq!(b.said("at least its first 6 characters"), 2);
+    // the whole id is always enough, however short
+    let b = Base::new();
+    b.rec(
+        A,
+        "s1",
+        r().last(3.0 * DAY)
+            .mtime(2.0 * DAY)
+            .archived()
+            .title("further along"),
+    );
+    b.rec(
+        B,
+        "s1",
+        r().last(5.0 * DAY)
+            .mtime(DAY)
+            .title("older, un-archived later"),
+    );
+    assert_eq!(b.s().resolve("s1").unwrap(), Some(String::from("s1")));
 }

@@ -225,7 +225,10 @@ fn test_half_written_file_is_never_copied() {
 fn test_destination_something_else_just_wrote_is_left_alone() {
     let b = Base::new();
     b.rec(A, "s1", r().last(1.0).mtime(600.0));
-    b.rec(B, "s1", r().last(HOUR).mtime(5.0)); // stale content, written 5 s ago
+    // stale content, written 2 s ago: a save may still be going on. (In the Python version this
+    // was 5 s, and held off for two minutes: here that long a wait is kept for when the app may
+    // really be writing in that folder; see while_the_app_runs.)
+    b.rec(B, "s1", r().last(HOUR).mtime(2.0));
     let stale = b.data(B, "s1");
     let done = b.s().run();
     assert_eq!(done.deferred, 1);

@@ -2,5 +2,5 @@
 #![windows_subsystem = "windows"]
 
 fn main() {
-    claude_session_sync::cli::process_main()
+    claude_session_sync::cli::process_main(true)
 }

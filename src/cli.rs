@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::consts::VERSION;
 use crate::daemon::{acquire_lock, lock_for_daemon};
 use crate::history::journal_entries;
-use crate::install::{self, Autostart, RealSystem, Settings, Setup, System, TASK_NAME};
+use crate::install::{self, Autostart, Given, RealSystem, Setup, System, TASK_NAME};
 use crate::paths::{Env, Paths};
 use crate::plan::{Kind, Plan};
 use crate::records::copy_in;
@@ -44,7 +44,7 @@ DAY TO DAY
     uninstall     Remove the daemon and its autostart (--purge: its files too)
 
 WHEN SOMETHING IS WRONG
-    resolve ID    Settle a conflict: the most advanced copy replaces the others
+    resolve ID    Settle a conflict: the most advanced copy wins (--all: all)
     restore ID    Bring back a session that --delete-sync took out
     undo          Take back what this tool did since a given time (--since)
 
@@ -61,6 +61,7 @@ OPTIONS
     --delete-sync    When a session is deleted in one account, take it out of
                      the others too. It is moved to quarantine, not erased:
                      status lists it and restore brings it back.
+    --no-delete-sync Turn that off again (the default is off)
     --interval N     daemon, install: seconds between full passes (default
                      3600, at least 60)
     --quick N        daemon, install: seconds between quick checks for changes
@@ -69,22 +70,29 @@ OPTIONS
     -n N             log: how many lines to show
     --purge          uninstall: also delete this tool's own files (programs,
                      log, backups, quarantine, replaced versions)
+    --all            resolve: settle every conflict there is, without an ID
     --version        Print the version
     --help           Print this help
 
     --days and --delete-sync go with preview, sync, daemon, status, resolve
-    and install. Give install the options the daemon is to run with.
+    and install. Give install the options the daemon is to run with: they are
+    remembered. Installing again without options (an update) keeps them, and
+    an option given then changes that one only. preview, sync, status and
+    resolve use the same settings unless told otherwise.
 
 EXAMPLES
     claude-session-sync preview --verbose
         See exactly what would change. Nothing is written.
     claude-session-sync install
         Keep the lists in sync from now on, and put this program on your PATH.
-        Run it again after an update, or with other options to change them.
+        Run it again after an update: the settings are kept.
+    claude-session-sync install --delete-sync
+        The same, and from now on carry deletions over to the other accounts.
     claude-session-sync status
         Is it running, is anything waiting, are there conflicts.
     claude-session-sync resolve 3f9c2a
         Settle the conflict that status reported for session 3f9c2a...
+        (resolve --all settles every conflict at once.)
     claude-session-sync undo --since \"2026-01-31 09:00\"
         Take back everything done since then. Uninstall (or pause) first, and
         close the Claude app completely.
@@ -92,7 +100,8 @@ EXAMPLES
 GOOD TO KNOW
     A session copied into the account you are signed in to shows up in the app
     after you restart it or sign in again.
-    status exits with 0 if the daemon is running and not stalled, 1 otherwise.
+    status exits with 0 if the daemon is running and not stalled, 1 otherwise;
+    sync exits with 1 if it could not make its pass or an item failed.
     This tool never uses the network. To update it, install the new version
     over the old one.
 
@@ -105,6 +114,7 @@ WHERE THINGS ARE
         replaced\\                           versions it replaced (14 days)
         quarantine\\                         sessions --delete-sync took out
         journal.jsonl                       what undo goes by
+        settings.json                       what install was told
     %APPDATA%\\Claude\\claude-code-sessions\\  the app's session lists (synced)
     %USERPROFILE%\\.claude\\projects\\         transcripts (only looked at)
 
@@ -140,8 +150,9 @@ pub enum Command {
     Stop,
     Pause,
     Resume,
+    /// `id` is None for `--all`.
     Resolve {
-        id: String,
+        id: Option<String>,
     },
     Restore {
         id: String,
@@ -149,9 +160,10 @@ pub enum Command {
     Undo {
         since: f64,
     },
+    /// What is None is kept from the previous install.
     Install {
-        interval: i64,
-        quick: i64,
+        interval: Option<i64>,
+        quick: Option<i64>,
     },
     Uninstall {
         purge: bool,
@@ -165,53 +177,54 @@ pub enum Command {
     Help,
 }
 
+/// A command line as given. `days` and `delete_sync` are None when they were not given: the
+/// settings the daemon was installed with then apply (30 days and off, if there are none).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Args {
     pub command: Command,
-    pub days: i64,
-    pub delete_sync: bool,
+    pub days: Option<i64>,
+    pub delete_sync: Option<bool>,
+}
+
+fn only(command: Command) -> Args {
+    Args {
+        command,
+        days: None,
+        delete_sync: None,
+    }
 }
 
 /// Parse the arguments (without the program name).
 pub fn parse_args(args: &[String]) -> Result<Args, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        return Ok(Args {
-            command: Command::Help,
-            days: 30,
-            delete_sync: false,
-        });
+        return Ok(only(Command::Help));
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        return Ok(Args {
-            command: Command::Version,
-            days: 30,
-            delete_sync: false,
-        });
+        return Ok(only(Command::Version));
     }
     let mut rest: Vec<String> = args.to_vec();
     let name = match rest.first() {
         Some(first) if !first.starts_with('-') => rest.remove(0),
         _ => String::from("preview"),
     };
-    let allowed: &[&str] = match name.as_str() {
-        "preview" => &["--verbose", "--days", "--delete-sync"],
-        "sync" | "status" | "resolve" => &["--days", "--delete-sync"],
-        "daemon" | "install" => &["--interval", "--quick", "--days", "--delete-sync"],
-        "undo" => &["--since"],
-        "log" => &["-n"],
-        "uninstall" => &["--purge"],
-        "stop" | "pause" | "resume" | "restore" | "__path" => &[],
-        "help" => {
-            return Ok(Args {
-                command: Command::Help,
-                days: 30,
-                delete_sync: false,
-            })
-        }
+    const COMMON: [&str; 3] = ["--days", "--delete-sync", "--no-delete-sync"];
+    let allowed: Vec<&str> = match name.as_str() {
+        "preview" => [&["--verbose"][..], &COMMON].concat(),
+        "sync" | "status" => COMMON.to_vec(),
+        "resolve" => [&["--all"][..], &COMMON].concat(),
+        "daemon" | "install" => [&["--interval", "--quick"][..], &COMMON].concat(),
+        "undo" => vec!["--since"],
+        "log" => vec!["-n"],
+        "uninstall" => vec!["--purge"],
+        "stop" | "pause" | "resume" | "restore" | "__path" => Vec::new(),
+        "help" => return Ok(only(Command::Help)),
         other => return Err(format!("unknown command '{}'", other)),
     };
-    let (mut interval, mut quick, mut days, mut lines) = (3600i64, 10i64, 30i64, 30i64);
-    let (mut delete_sync, mut verbose, mut purge) = (false, false, false);
+    let (mut interval, mut quick, mut days): (Option<i64>, Option<i64>, Option<i64>) =
+        (None, None, None);
+    let mut lines = 30i64;
+    let mut delete_sync: Option<bool> = None;
+    let (mut verbose, mut purge, mut all) = (false, false, false);
     let mut since: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.into_iter();
@@ -227,14 +240,19 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         if !allowed.contains(&opt.as_str()) {
             return Err(format!("unknown option '{}' for '{}'", opt, name));
         }
-        if opt == "--verbose" || opt == "--delete-sync" || opt == "--purge" {
+        if matches!(
+            opt.as_str(),
+            "--verbose" | "--delete-sync" | "--no-delete-sync" | "--purge" | "--all"
+        ) {
             if inline.is_some() {
                 return Err(format!("'{}' takes no value", opt));
             }
             match opt.as_str() {
                 "--verbose" => verbose = true,
                 "--purge" => purge = true,
-                _ => delete_sync = true,
+                "--all" => all = true,
+                "--delete-sync" => delete_sync = Some(true),
+                _ => delete_sync = Some(false),
             }
             continue;
         }
@@ -251,25 +269,27 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             .parse()
             .map_err(|_| format!("'{}' needs a whole number, not '{}'", opt, value))?;
         match opt.as_str() {
-            "--interval" => interval = n,
-            "--quick" => quick = n,
+            "--interval" => interval = Some(n),
+            "--quick" => quick = Some(n),
             "-n" => lines = n,
-            _ => days = n,
+            _ => days = Some(n),
         }
     }
-    let wants_id = name == "resolve" || name == "restore";
     if name == "__path" {
         return match positional.as_slice() {
-            [what] if what == "add" || what == "remove" => Ok(Args {
-                command: Command::PathSetup { add: what == "add" },
-                days,
-                delete_sync,
-            }),
+            [what] if what == "add" || what == "remove" => {
+                Ok(only(Command::PathSetup { add: what == "add" }))
+            }
             _ => Err(String::from("'__path' is for this tool's own use")),
         };
     }
+    let wants_id = name == "restore" || (name == "resolve" && !all);
     if positional.len() != usize::from(wants_id) {
-        return Err(if wants_id {
+        return Err(if name == "resolve" && all {
+            String::from("'resolve --all' takes no session id")
+        } else if name == "resolve" {
+            String::from("'resolve' needs one session id (or its first characters), or --all")
+        } else if wants_id {
             format!("'{}' needs one session id (or its first characters)", name)
         } else {
             format!("unexpected argument '{}'", positional[0])
@@ -278,7 +298,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     let command = match name.as_str() {
         "preview" => Command::Preview { verbose },
         "sync" => Command::Sync,
-        "daemon" => Command::Daemon { interval, quick },
+        "daemon" => Command::Daemon {
+            interval: interval.unwrap_or(3600),
+            quick: quick.unwrap_or(10),
+        },
         "status" => Command::Status,
         "log" => Command::Log {
             lines: lines.max(0) as usize,
@@ -287,7 +310,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         "pause" => Command::Pause,
         "resume" => Command::Resume,
         "resolve" => Command::Resolve {
-            id: positional.remove(0),
+            id: positional.pop(),
         },
         "restore" => Command::Restore {
             id: positional.remove(0),
@@ -316,6 +339,9 @@ pub type Sink = Rc<RefCell<dyn Write>>;
 pub struct Console {
     pub out: Sink,
     pub err: Sink,
+    /// True for the program without a console window: what goes wrong before it has started
+    /// is then written to the log, as there is nowhere else for it to be seen.
+    pub windowless: bool,
 }
 
 impl Console {
@@ -323,6 +349,7 @@ impl Console {
         Console {
             out: Rc::new(RefCell::new(io::stdout())),
             err: Rc::new(RefCell::new(io::stderr())),
+            windowless: false,
         }
     }
 
@@ -333,6 +360,7 @@ impl Console {
             Console {
                 out: buf.clone(),
                 err: buf.clone(),
+                windowless: false,
             },
             buf,
         )
@@ -364,19 +392,76 @@ fn log_line(paths: &Paths, msg: &str) {
     })();
 }
 
-/// Print what a pass would do. Returns the number of pending changes.
-pub fn preview(s: &mut Sync, con: &Console, verbose: bool, conflicts: bool) -> usize {
-    let plan = s.plan();
-    print_plan(s.days, &plan, con, verbose, conflicts)
+/// What a plan leaves to be done: changes in waiting, and routine refreshes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pending {
+    /// Changes that are waiting to be made.
+    pub changes: usize,
+    /// Copies of sessions in use that the running daemon brings up to date once a minute:
+    /// nothing is wrong or waiting when these are due.
+    pub refreshes: usize,
 }
 
-fn print_plan(days: f64, plan: &Plan, con: &Console, verbose: bool, conflicts: bool) -> usize {
+impl Pending {
+    /// `in sync`, or how many changes are pending.
+    pub fn line(&self) -> String {
+        let refreshes = match self.refreshes {
+            0 => String::new(),
+            1 => String::from("1 refresh of a session in use is due within a minute"),
+            n => format!("{} refreshes of sessions in use are due within a minute", n),
+        };
+        match (self.changes, self.refreshes) {
+            (0, 0) => String::from("in sync"),
+            (0, _) => format!("in sync ({})", refreshes),
+            (n, 0) => format!("{} change(s) pending", n),
+            (n, _) => format!("{} change(s) pending (and {})", n, refreshes),
+        }
+    }
+}
+
+/// Print what a pass would do. `daemon_running` says whether a daemon is at work: then the
+/// refreshes it makes once a minute are not counted as changes in waiting.
+pub fn preview(
+    s: &mut Sync,
+    con: &Console,
+    verbose: bool,
+    conflicts: bool,
+    daemon_running: bool,
+) -> Pending {
+    let plan = s.plan();
+    print_plan(s.days, &plan, con, verbose, conflicts, daemon_running)
+}
+
+fn print_plan(
+    days: f64,
+    plan: &Plan,
+    con: &Console,
+    verbose: bool,
+    conflicts: bool,
+    daemon_running: bool,
+) -> Pending {
     let (scan, acts, notes) = (&plan.scan, &plan.acts, &plan.notes);
+    let refreshes = if daemon_running {
+        acts.iter().filter(|a| a.refresh).count()
+    } else {
+        0
+    };
+    let pending = Pending {
+        changes: acts.len() - refreshes,
+        refreshes,
+    };
     con.say(&format!(
-        "account folders: {}   sessions: {}   pending changes: {}",
+        "account folders: {}   sessions: {}   pending changes: {}{}",
         scan.lv.len(),
         scan.records.len(),
-        acts.len()
+        pending.changes,
+        match refreshes {
+            0 => String::new(),
+            n => format!(
+                "   refreshes of sessions in use, due within a minute: {}",
+                n
+            ),
+        }
     ));
     for (name, _) in &scan.lv {
         let count = |k: Kind| {
@@ -444,7 +529,7 @@ fn print_plan(days: f64, plan: &Plan, con: &Console, verbose: bool, conflicts: b
             ));
         }
         if !notes.conflicts.is_empty() {
-            con.say("  (a conflict ends when the session is used again, or with: resolve <id>)");
+            con.say("  (a conflict ends when the session is used again, or with: resolve <id>, resolve --all)");
         }
         let mut titles: Vec<&String> = notes.deleted_elsewhere.iter().map(|d| &d.1).collect();
         titles.sort();
@@ -481,7 +566,7 @@ fn print_plan(days: f64, plan: &Plan, con: &Console, verbose: bool, conflicts: b
             ));
         }
     }
-    acts.len()
+    pending
 }
 
 fn when(v: Option<&Value>) -> String {
@@ -514,13 +599,36 @@ fn count(n: usize, one: &str) -> String {
     format!("{} {}{}", n, one, if n == 1 { "" } else { "s" })
 }
 
+/// What to say when the app's session store is not where it was looked for. Nothing if it
+/// is there.
+pub fn store_notice(env: &Env, paths: &Paths) -> Vec<String> {
+    if paths.root.is_dir() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::from(
+        "The Claude app's session store was not found. Looked for:",
+    )];
+    let looked = match &env.store_override {
+        Some(named) => vec![named.clone()],
+        None => crate::paths::store_candidates(env),
+    };
+    for place in looked {
+        lines.push(format!("  {}", place.display()));
+    }
+    lines.push(String::from(
+        "If the app keeps its claude-code-sessions folder somewhere else, name that folder in the",
+    ));
+    lines.push(String::from(
+        "environment variable CLAUDE_SESSION_SYNC_STORE. (If the Code tab of the Claude desktop app",
+    ));
+    lines.push(String::from(
+        "has never been used on this PC, there is nothing to sync yet.)",
+    ));
+    lines
+}
+
 /// Is the daemon alive, what is pending. 0 = running and not stalled.
-pub fn status(
-    s: &mut Sync,
-    con: &Console,
-    sys: &mut dyn System,
-    localappdata: Option<&std::path::Path>,
-) -> io::Result<i32> {
+pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> io::Result<i32> {
     let home = s.p.home.clone();
     let running = match acquire_lock(&home)? {
         Some(lock) => {
@@ -536,7 +644,7 @@ pub fn status(
         Some(Value::Object(m)) => m,
         _ => serde_json::Map::new(),
     };
-    let autostart = install::autostart(sys, localappdata);
+    let autostart = install::autostart(sys, env.localappdata.as_deref());
     let paused = autostart == (Autostart::Task { paused: true });
     let version = st
         .get("version")
@@ -546,7 +654,11 @@ pub fn status(
     // it reports every minute, whatever its settings
     let stalled = running && age.is_some_and(|a| a > 660.0);
     if running {
+        // look with the eyes of the daemon that is at work
         s.delete_sync = truthy(st.get("delete_sync"));
+        if let Some(days) = num(st.get("days")) {
+            s.days = days;
+        }
     }
     let plan = s.plan();
 
@@ -598,6 +710,9 @@ pub fn status(
         Autostart::Unknown => String::from("autostart: unknown (Task Scheduler could not be asked)"),
     });
     con.say("");
+    for line in store_notice(env, &s.p) {
+        con.say(&line);
+    }
 
     if running {
         let pid = st
@@ -640,19 +755,25 @@ pub fn status(
             shown(st.get("last_error"))
         ));
     }
-    let pending = print_plan(s.days, &plan, con, false, true);
-    con.say(&if pending == 0 {
-        String::from("in sync")
-    } else {
-        format!("{} change(s) pending", pending)
-    });
-    // what --delete-sync took out of the other accounts lately
+    let pending = print_plan(s.days, &plan, con, false, true, running && !stalled);
+    con.say(&pending.line());
+    // What --delete-sync took out of the other accounts lately, and has not been brought back.
     let week_ago = winfs::real_now() - 7.0 * 86400.0;
-    let gone: Vec<_> = journal_entries(&home)
-        .into_iter()
+    let journal = journal_entries(&home);
+    let brought_back = |fid: &str, after: f64| {
+        journal.iter().any(|e| {
+            e.get("kind").and_then(Value::as_str) == Some("restore")
+                && e.get("fid").and_then(Value::as_str) == Some(fid)
+                && num(e.get("t")).unwrap_or(0.0) >= after
+        })
+    };
+    let gone: Vec<_> = journal
+        .iter()
         .filter(|e| {
+            let t = num(e.get("t")).unwrap_or(0.0);
             e.get("kind").and_then(Value::as_str) == Some("quarantine")
-                && num(e.get("t")).unwrap_or(0.0) > week_ago
+                && t > week_ago
+                && !brought_back(e.get("fid").and_then(Value::as_str).unwrap_or(""), t)
         })
         .collect();
     if !gone.is_empty() {
@@ -708,9 +829,11 @@ pub fn run_with(args: &[String], env: &Env, con: &Console, sys: &mut dyn System)
     let parsed = match parse_args(args) {
         Ok(p) => p,
         Err(e) => {
-            // the windowless program has no console: leave a trace where it can be found
-            if let Ok(paths) = Paths::discover(env) {
-                log_line(&paths, &format!("bad arguments, not started: {:?}", args));
+            // the program without a console has nowhere to say it: leave a trace in the log
+            if con.windowless {
+                if let Ok(paths) = Paths::discover(env) {
+                    log_line(&paths, &format!("bad arguments, not started: {:?}", args));
+                }
             }
             con.complain(&format!("claude-session-sync: {}", e));
             con.complain("For the commands and options:  claude-session-sync --help");
@@ -771,17 +894,33 @@ fn execute(
         return Ok(0);
     }
     let mut s = Sync::new(paths.clone());
-    s.days = parsed.days as f64;
-    s.delete_sync = parsed.delete_sync;
+    // What is not given is what the daemon was installed with, so that a look from the command
+    // line sees what the daemon sees. (The daemon itself goes by its own arguments alone.)
+    let installed = match parsed.command {
+        Command::Daemon { .. } => None,
+        _ => install::load_settings(&home),
+    };
+    s.days = parsed
+        .days
+        .or(installed.as_ref().map(|i| i.days))
+        .unwrap_or(30) as f64;
+    s.delete_sync = parsed
+        .delete_sync
+        .or(installed.as_ref().map(|i| i.delete_sync))
+        .unwrap_or(false);
     let sink = con.clone();
     s.out = Box::new(move |line: &str| sink.say(line));
     match &parsed.command {
         Command::Help | Command::Version | Command::Log { .. } | Command::PathSetup { .. } => Ok(0),
         Command::Preview { verbose } => {
-            preview(&mut s, con, *verbose, false);
+            for line in store_notice(env, &paths) {
+                con.say(&line);
+            }
+            let running = crate::daemon::is_running(&home);
+            preview(&mut s, con, *verbose, false, running);
             Ok(0)
         }
-        Command::Status => status(&mut s, con, sys, env.localappdata.as_deref()).map_err(io_err),
+        Command::Status => status(&mut s, con, sys, env).map_err(io_err),
         Command::Stop => {
             if install::stop_daemon(&home, 40, &mut real_sleep).map_err(io_err)? {
                 con.say("stopped");
@@ -791,11 +930,31 @@ fn execute(
                 Ok(1)
             }
         }
-        Command::Resolve { id } => Ok(if s.resolve(id).map_err(io_err)?.is_some() {
-            0
-        } else {
-            1
-        }),
+        Command::Resolve { id } => {
+            let (asked, code) = match id {
+                Some(id) => {
+                    let found = s.resolve(id).map_err(io_err)?;
+                    let code = if found.is_some() { 0 } else { 1 };
+                    (found.into_iter().count(), code)
+                }
+                None => {
+                    let found = s.resolve_all().map_err(io_err)?;
+                    con.say(&match found.len() {
+                        0 => String::from("there are no conflicts to settle"),
+                        n => format!("{} to be settled", count(n, "conflict")),
+                    });
+                    (found.len(), 0)
+                }
+            };
+            if asked > 0 {
+                con.say(if crate::daemon::is_running(&home) {
+                    "the daemon carries it out on its next pass (while the app has that account open, when it leaves it)"
+                } else {
+                    "no daemon is running: run `claude-session-sync sync` (or start the daemon) to carry it out"
+                });
+            }
+            Ok(code)
+        }
         Command::Restore { id } => Ok(if s.restore(id).map_err(io_err)?.is_some() {
             0
         } else {
@@ -820,7 +979,7 @@ fn execute(
             let result = match &parsed.command {
                 Command::Undo { since } => {
                     con.say("Close the Claude app completely (tray icon too) before relying on the result.");
-                    s.undo(*since).map(|_| ()).map_err(io_err)
+                    s.undo(*since).map(|_| 0).map_err(io_err)
                 }
                 Command::Daemon { interval, quick } => {
                     s.watch(
@@ -830,7 +989,7 @@ fn execute(
                         None,
                         &mut real_sleep,
                     );
-                    Ok(())
+                    Ok(0)
                 }
                 _ => {
                     let done = s.run();
@@ -838,11 +997,12 @@ fn execute(
                         "one-off: added {}, updated {}, repaired {}, aligned {}, removed {}, waiting {}, failed {}",
                         done.add, done.update, done.repair, done.aligned, done.quarantine, done.deferred, done.failed
                     ));
-                    Ok(())
+                    // a pass that could not be made, or that left items failed, is not a success
+                    Ok(if s.aborted || done.failed > 0 { 1 } else { 0 })
                 }
             };
             drop(lock);
-            result.map(|_| 0)
+            result
         }
         Command::Install { .. } | Command::Uninstall { .. } | Command::Pause | Command::Resume => {
             let current_exe = std::env::current_exe().map_err(io_err)?;
@@ -856,11 +1016,11 @@ fn execute(
                 say: &mut say,
             };
             match &parsed.command {
-                Command::Install { interval, quick } => setup.install(&Settings {
-                    interval: (*interval).max(60),
-                    quick: (*quick).max(0),
-                    delete_sync: parsed.delete_sync,
+                Command::Install { interval, quick } => setup.install(&Given {
+                    interval: *interval,
+                    quick: *quick,
                     days: parsed.days,
+                    delete_sync: parsed.delete_sync,
                 })?,
                 Command::Uninstall { purge } => setup.uninstall(*purge)?,
                 Command::Pause => setup.pause()?,
@@ -871,11 +1031,16 @@ fn execute(
     }
 }
 
-/// The whole program: both executables call this.
-pub fn process_main() -> ! {
+/// The whole program: both executables call this. `windowless` is true for the one without
+/// a console window.
+pub fn process_main(windowless: bool) -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let env = Env::from_process();
-    let outcome = catch_unwind(AssertUnwindSafe(|| run(&args, &env, &Console::stdio())));
+    let console = Console {
+        windowless,
+        ..Console::stdio()
+    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| run(&args, &env, &console)));
     let code = match outcome {
         Ok(code) => code,
         Err(payload) => {

@@ -46,6 +46,9 @@ pub struct Act {
     pub ts: Option<i64>,
     /// Quarantine: every id of the session, for its markers.
     pub ids: BTreeSet<String>,
+    /// Update: the copy that is there is one this tool placed, so this is the routine refresh
+    /// of a session in use (which the daemon makes once a minute), not a change in waiting.
+    pub refresh: bool,
 }
 
 impl Act {
@@ -174,6 +177,34 @@ impl Sync {
             for (name, _) in copies {
                 if let Some(set) = cur.get_mut(name) {
                     set.insert(fid.clone());
+                }
+            }
+        }
+        if self.prev.is_none() {
+            // The first look of this process. What an earlier process saw vanish is still to be
+            // respected for the rest of its five minutes...
+            let noted = self.noted_vanished();
+            for (name, fid, t) in &noted {
+                self.vanished
+                    .entry((name.clone(), fid.clone()))
+                    .or_insert(*t);
+            }
+            // ...and a copy this tool placed that is gone now, with no marker beside it, may be in
+            // the middle of being deleted for all this process knows: it has just vanished.
+            for (name, path) in &scan.lv {
+                for fid in &scan.order {
+                    if cur[name].contains(fid) || scan.tombs[name].contains_key(fid) {
+                        continue;
+                    }
+                    if noted.iter().any(|n| n.0 == *name && n.1 == *fid) {
+                        continue; // (seen before: its time runs from then, and may be up)
+                    }
+                    let file = path.join(format!("local_{}.json", fid));
+                    if self.manifest.contains_key(&winfs::norm(&file)) {
+                        self.vanished
+                            .entry((name.clone(), fid.clone()))
+                            .or_insert(now);
+                    }
                 }
             }
         }
@@ -309,6 +340,7 @@ impl Sync {
         let now = self.now();
         let cutoff = (now - self.days * 86400.0) * 1000.0;
         let (since, blackouts) = self.deletion_window();
+        let exempt = self.exemptions();
         let hold = self.in_use(&scan);
         self.hold = (now, hold.clone());
         let homes = self.homes();
@@ -394,6 +426,8 @@ impl Sync {
                                 && !blackouts
                                     .iter()
                                     .any(|b| b.0 <= ts as f64 && ts as f64 <= b.1)
+                                // (a deletion that was carried over and undone is not carried again)
+                                && !exempt.get(fid).is_some_and(|until| ts as f64 <= *until)
                         })
                         .collect();
                     let latest = carried.iter().max().copied();
@@ -411,6 +445,7 @@ impl Sync {
                                     expect: Some((r.mtime, r.size)),
                                     ts: latest,
                                     ids: ids.clone(),
+                                    refresh: false,
                                 });
                             }
                         }
@@ -454,10 +489,8 @@ impl Sync {
                         ));
                     } else if self.go(&mut gate, &mut notes, Kind::Update, fid, name, &cur.title) {
                         let pushed = self.pushed.get(fid).copied().unwrap_or(0.0);
-                        if !self.urgent
-                            && self.rec_is_ours(cur)
-                            && (0.0..REFRESH_SEC).contains(&(now - pushed))
-                        {
+                        let ours = self.rec_is_ours(cur);
+                        if !self.urgent && ours && (0.0..REFRESH_SEC).contains(&(now - pushed)) {
                             // a busy session: our copies follow it once a minute, not every save
                             notes.waiting_turn += 1;
                             let due = pushed + REFRESH_SEC;
@@ -474,6 +507,7 @@ impl Sync {
                                 expect: Some((cur.mtime, cur.size)),
                                 ts: None,
                                 ids: BTreeSet::new(),
+                                refresh: ours,
                             });
                         }
                     }
@@ -500,6 +534,7 @@ impl Sync {
                             expect: Some((there.1.unwrap_or(0), there.2.unwrap_or(0))),
                             ts: None,
                             ids: BTreeSet::new(),
+                            refresh: false,
                         });
                         placed = true;
                     }
@@ -533,6 +568,7 @@ impl Sync {
                         expect: None,
                         ts: None,
                         ids: BTreeSet::new(),
+                        refresh: false,
                     });
                     if let Some(set) = leaf_ids.get_mut(name) {
                         set.insert(fid.clone());

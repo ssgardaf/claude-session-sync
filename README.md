@@ -10,7 +10,7 @@ every account on the PC, so after a switch your sessions are there and you can c
 
 - Windows 10/11, one small program, no runtime to install
 - Never touches transcripts or sign-in data
-- Keeps a copy of anything it replaces, and can undo everything it did
+- Keeps a copy of anything it replaces (for 14 days), and can undo what it did
 
 > Unofficial. Not made or endorsed by Anthropic. It relies on how the desktop app
 > stores its session list today, which is not documented and can change with any app
@@ -38,7 +38,19 @@ What the installer does, so you know:
   you log on and restarts it if it ever stops;
 - starts the daemon and checks that it really came up.
 
-**Update:** run the same line again. **Remove:** `claude-session-sync uninstall`.
+**Update:** run the same line again; your settings are kept.
+**Remove:** `claude-session-sync uninstall`.
+
+To install with options (see [Configuration](#configuration)), pass them like this:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ssgardaf/claude-session-sync/main/install.ps1))) --delete-sync
+```
+
+If you already used several accounts before installing, `status` may list some
+*conflicts*: sessions whose copies differ in a way the tool will not decide for you.
+That is expected. See [Conflicts](#what-it-will-and-will-not-do); `claude-session-sync
+resolve --all` settles them in one go.
 
 Prefer to look first? Download `claude-session-sync-windows-x64.zip` from the
 [latest release](../../releases/latest), unzip it, and run
@@ -117,8 +129,8 @@ trusted, because the app re-saves records without any activity.
 **Conflicts.** If the copies differ in something *you* decided (archived or not, the
 title) and the tool cannot tell which came later, it changes nothing and reports a
 conflict in `status`. Both copies stay. A conflict ends by itself when you use the
-session again, or with `claude-session-sync resolve <id>`, which puts the most advanced
-copy everywhere.
+session again, or with `claude-session-sync resolve <id>` (or `resolve --all`), which
+puts the most advanced copy everywhere and keeps the replaced one.
 
 **Deleted sessions.** A session you delete in an account is never put back there, and
 is not handed to accounts that never had it. By default it stays in the other accounts
@@ -140,16 +152,17 @@ are skipped, since they could not be resumed anyway.
   (`replaced\`, 14 days, up to 200 MB).
 - Before the first change of each day it zips the whole session store (`backups\`; the
   first backup ever is kept for good). If the backup cannot be made, nothing is written.
-- Every write is journaled first. `undo --since` takes out what was added, puts back
-  what was replaced, and returns what was moved to quarantine. Files the app has changed
-  since are left alone.
+- Every addition, replacement and removal is written to a journal before it happens.
+  (Refreshing a copy the tool placed itself is not: nothing of yours is in it.)
+  `undo --since` takes out what was added, puts back what was replaced, and returns what
+  was moved to quarantine. Files the app has changed since are left alone. Undo reaches
+  back as far as the kept versions do: 14 days.
 - A record it cannot make sense of (a newer format, a locked file, anything over 10 MB)
   is neither copied nor replaced.
 - Writes are atomic, and re-checked at the last instant: if a file appeared or changed
   in that moment, it is left alone and looked at again later.
 - It does not link folders together. Current app builds refuse to save into a linked
   folder, which silently loses new sessions.
-
 - It never uses the network.
 
 Its own files are in `%USERPROFILE%\.claude-session-sync`: `sync.log`, `journal.jsonl`,
@@ -163,7 +176,9 @@ claude-session-sync uninstall
 
 removes the scheduled task and the `PATH` entry and stops the daemon. The copies it made
 stay where they are (your accounts keep the full list), and so do its backups and log.
-`claude-session-sync uninstall --purge` also deletes the tool's own folder.
+`claude-session-sync uninstall --purge` also deletes the tool's own folder (the programs
+themselves a few seconds later, since a running program cannot delete itself; if
+anything is left, it tells you what).
 
 To also take back what it did, quit the Claude app completely and run:
 
@@ -173,6 +188,8 @@ claude-session-sync undo --since "2026-01-31 14:00"
 
 To go back to the state before you ever ran it: quit the app, empty
 `%APPDATA%\Claude\claude-code-sessions`, and unzip the oldest file in `backups\` there.
+Mind that this also takes sessions you started since then off the list (their
+transcripts stay on disk); `undo` is the gentler way.
 
 ## Limits
 
@@ -187,8 +204,8 @@ To go back to the state before you ever ran it: quit the app, empty
   you sign out reaches the other accounts 2 to 5 seconds later. Sign in to the next
   account faster than that and you may see that one session in its previous state;
   using it there makes that copy the current one (the replaced version is kept).
-- **A new account's first sign-in.** The account is recognised after about a minute;
-  sign out and in once more to see the list.
+- **A new account's first sign-in.** The account is recognised after about a minute and
+  a half; sign out and in once more to see the list.
 - **Session-to-session messages** between sessions that were started under different
   accounts are not known to work.
 - **Your accounts, your responsibility.** Whether using several accounts fits
@@ -196,10 +213,12 @@ To go back to the state before you ever ran it: quit the app, empty
 
 ## Configuration
 
-Settings are given to `install` and stay until you run it again:
+Settings are given to `install`. They are remembered, so an update keeps them; to change
+one, run `install` again with that option:
 
 ```
 claude-session-sync install --delete-sync --days 60
+claude-session-sync install --no-delete-sync
 ```
 
 | Option | Default | Meaning |
@@ -232,8 +251,8 @@ toolchain work. The two programs are in `target\release`: `claude-session-sync.e
 the command-line tool, `claude-session-syncw.exe` is the same program without a console
 window, which the scheduled task runs.
 
-The test suite (about 170 tests) builds throwaway folders and never looks at your real
-profile.
+The test suite (more than 200 tests) works in throwaway folders and never writes to your
+real profile. A few tests read the process list and the task list.
 
 ## License
 

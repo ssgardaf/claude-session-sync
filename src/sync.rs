@@ -577,6 +577,75 @@ impl Sync {
         (Some(since), blackouts)
     }
 
+    /// Deletions that were carried over and then taken back with `undo`: session id -> the time
+    /// (epoch ms) of the deletion marker that was undone. A marker of that time or earlier does
+    /// not take the session out of the other accounts again.
+    pub(crate) fn exemptions(&self) -> HashMap<String, f64> {
+        match self.state().get("exempt") {
+            Some(Value::Object(m)) => m
+                .iter()
+                .filter_map(|(fid, ts)| num(Some(ts)).map(|ts| (fid.clone(), ts)))
+                .collect(),
+            _ => HashMap::new(),
+        }
+    }
+
+    pub(crate) fn exempt(&mut self, fid: &str, ts: f64) -> io::Result<()> {
+        let mut st = self.state();
+        let mut exempt = match st.get("exempt") {
+            Some(Value::Object(m)) => m.clone(),
+            _ => Map::new(),
+        };
+        let until = num(exempt.get(fid)).map_or(ts, |had| had.max(ts));
+        exempt.insert(fid.to_string(), num_json(until));
+        st.insert("exempt".into(), Value::Object(exempt));
+        self.write_state(&st)
+    }
+
+    /// The records an earlier process saw vanish without a marker: (leaf, fid, when).
+    pub(crate) fn noted_vanished(&self) -> Vec<(String, String, f64)> {
+        let mut out = Vec::new();
+        if let Some(Value::Array(list)) = self.state().get("vanished") {
+            for item in list {
+                if let Value::Array(v) = item {
+                    if let (Some(leaf), Some(fid), Some(t)) = (
+                        v.first().and_then(Value::as_str),
+                        v.get(1).and_then(Value::as_str),
+                        num(v.get(2)),
+                    ) {
+                        out.push((leaf.to_string(), fid.to_string(), t));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Keep what has just vanished on record, so that a process started in the next minutes
+    /// (a restart, a one-off `sync`) does not put it back at once either.
+    pub(crate) fn save_vanished(&mut self) -> io::Result<()> {
+        let mut noted: Vec<(&(String, String), &f64)> = self.vanished.iter().collect();
+        noted.sort_by(|a, b| a.0.cmp(b.0));
+        let want: Vec<Value> = noted
+            .into_iter()
+            .map(|((leaf, fid), t)| json!([leaf, fid, t]))
+            .collect();
+        let mut st = self.state();
+        let have = match st.get("vanished") {
+            Some(Value::Array(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        if want == have {
+            return Ok(());
+        }
+        if want.is_empty() {
+            st.remove("vanished");
+        } else {
+            st.insert("vanished".into(), Value::Array(want));
+        }
+        self.write_state(&st)
+    }
+
     /// Record that the tool is running now (and, on first use, from when deletions may be carried).
     pub fn touch_alive(&mut self, force: bool) -> io::Result<()> {
         let now = self.now();

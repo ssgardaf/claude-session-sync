@@ -31,7 +31,9 @@ pub const SETUP_TASK_NAME: &str = "Claude Session Sync (setup)";
 pub const PATH_RESULT: &str = "path-result.txt";
 
 /// This tool's own files in its state folder: what `uninstall --purge` deletes there.
-const OWN_FILES: [&str; 11] = [
+const OWN_FILES: [&str; 13] = [
+    "settings.json",
+    "setup-task.xml",
     "sync.log",
     "sync.log.1",
     "journal.jsonl",
@@ -65,6 +67,112 @@ impl Default for Settings {
             days: 30,
         }
     }
+}
+
+/// What `install` was told on the command line. What is not given is kept from the previous
+/// install, or is the default on a first one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Given {
+    pub interval: Option<i64>,
+    pub quick: Option<i64>,
+    pub days: Option<i64>,
+    pub delete_sync: Option<bool>,
+}
+
+/// The file in the state folder that keeps the settings the daemon was installed with.
+pub const SETTINGS_FILE: &str = "settings.json";
+
+/// The settings the daemon was last installed with, if that is on record.
+pub fn load_settings(home: &Path) -> Option<Settings> {
+    let saved: Value = serde_json::from_slice(&fs::read(home.join(SETTINGS_FILE)).ok()?).ok()?;
+    let saved = saved.as_object()?;
+    let default = Settings::default();
+    let number = |key: &str, or: i64| saved.get(key).and_then(Value::as_i64).unwrap_or(or);
+    Some(Settings {
+        interval: number("interval", default.interval),
+        quick: number("quick", default.quick),
+        days: number("days", default.days),
+        delete_sync: saved
+            .get("delete_sync")
+            .and_then(Value::as_bool)
+            .unwrap_or(default.delete_sync),
+    })
+}
+
+pub fn save_settings(home: &Path, s: &Settings) -> io::Result<()> {
+    fs::create_dir_all(home)?;
+    let text = serde_json::json!({
+        "interval": s.interval,
+        "quick": s.quick,
+        "days": s.days,
+        "delete_sync": s.delete_sync,
+    })
+    .to_string();
+    match winfs::atomic_write(
+        &home.join(SETTINGS_FILE),
+        text.as_bytes(),
+        None,
+        true,
+        Expect::Any,
+    ) {
+        Ok(()) => Ok(()),
+        Err(winfs::WriteError::Io(e)) => Err(e),
+        Err(winfs::WriteError::Changed) => Err(io::Error::other("settings.json changed")),
+    }
+}
+
+/// The settings in a daemon's command line (this version's `daemon ...`, or the earlier
+/// Python version's `... --watch ...`). None if it is not such a command line.
+pub fn settings_from_arguments(arguments: &str) -> Option<Settings> {
+    let tokens: Vec<&str> = arguments.split_whitespace().collect();
+    if !tokens.iter().any(|t| *t == "daemon" || *t == "--watch") {
+        return None;
+    }
+    let mut s = Settings::default();
+    let mut i = 0;
+    while i < tokens.len() {
+        let (name, inline) = match tokens[i].split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (tokens[i], None),
+        };
+        if matches!(name, "--interval" | "--quick" | "--days") {
+            let value = match inline {
+                Some(v) => Some(v),
+                None => {
+                    i += 1;
+                    tokens.get(i).copied()
+                }
+            };
+            if let Some(n) = value.and_then(|v| v.parse::<i64>().ok()) {
+                match name {
+                    "--interval" => s.interval = n,
+                    "--quick" => s.quick = n,
+                    _ => s.days = n,
+                }
+            }
+        } else if name == "--delete-sync" {
+            s.delete_sync = true;
+        } else if name == "--no-delete-sync" {
+            s.delete_sync = false;
+        }
+        i += 1;
+    }
+    Some(s)
+}
+
+/// The settings of the daemon a registered task starts, read from the task's definition (as
+/// `schtasks /Query /XML` prints it). This is how an install made before the settings were
+/// kept in a file hands them on.
+pub fn settings_from_task(xml: &str) -> Option<Settings> {
+    let start = xml.find("<Arguments>")? + "<Arguments>".len();
+    let end = start + xml[start..].find("</Arguments>")?;
+    let arguments = xml[start..end]
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    settings_from_arguments(&arguments)
 }
 
 /// The arguments the scheduled task passes to the windowless program.
@@ -181,17 +289,18 @@ pub fn task_xml(
     lines.join("\r\n") + "\r\n"
 }
 
-/// The definition of the one-off task that runs the hidden `__path` command outside the
-/// app's sandbox. It has no trigger: it is registered, started on demand and deleted again.
-/// Unlike a task made with `schtasks /SC ONCE`, it also starts on battery; it is hidden, and
-/// may run for a minute at most.
-pub fn setup_task_xml(exe: &Path, arguments: &str, workdir: &Path, user: &str) -> String {
+/// The definition of a one-off task: the one that runs the hidden `__path` command outside
+/// the app's sandbox, or the one that deletes the programs once they have ended. It has no
+/// trigger: it is registered, started on demand and deleted again. Unlike a task made with
+/// `schtasks /SC ONCE`, it also starts on battery; it is hidden, and may run for a minute at
+/// most.
+pub fn setup_task_xml(exe: &Path, arguments: &str, workdir: Option<&Path>, user: &str) -> String {
     let lines = [
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>".to_string(),
         "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
             .to_string(),
         "  <RegistrationInfo>".to_string(),
-        "    <Description>Set up by claude-session-sync to change the user's PATH once; deleted right after.</Description>"
+        "    <Description>A one-off step of claude-session-sync's install or uninstall; deleted right after.</Description>"
             .to_string(),
         "  </RegistrationInfo>".to_string(),
         "  <Triggers />".to_string(),
@@ -224,14 +333,18 @@ pub fn setup_task_xml(exe: &Path, arguments: &str, workdir: &Path, user: &str) -
             xml_escape(&exe.to_string_lossy())
         ),
         format!("      <Arguments>{}</Arguments>", xml_escape(arguments)),
-        format!(
-            "      <WorkingDirectory>{}</WorkingDirectory>",
-            xml_escape(&workdir.to_string_lossy())
-        ),
+        match workdir {
+            Some(dir) => format!(
+                "      <WorkingDirectory>{}</WorkingDirectory>",
+                xml_escape(&dir.to_string_lossy())
+            ),
+            None => String::new(),
+        },
         "    </Exec>".to_string(),
         "  </Actions>".to_string(),
         "</Task>".to_string(),
     ];
+    let lines: Vec<String> = lines.into_iter().filter(|l| !l.is_empty()).collect();
     lines.join("\r\n") + "\r\n"
 }
 
@@ -633,7 +746,7 @@ impl Setup<'_> {
         let _ = fs::remove_file(&result);
         let user = task_user(self.env).ok_or("USERNAME is not set")?;
         let arguments = if add { "__path add" } else { "__path remove" };
-        let xml = setup_task_xml(&program, arguments, bin, &user);
+        let xml = setup_task_xml(&program, arguments, Some(bin), &user);
         let xml_path = base.join("setup-task.xml");
         fs::write(&xml_path, utf16_file(&xml))
             .map_err(|e| format!("cannot write {}: {}", xml_path.display(), e))?;
@@ -699,7 +812,7 @@ impl Setup<'_> {
     /// Register the daemon so it starts by itself and is restarted if it ever stops, and put
     /// the programs on the PATH. Safe to run again after an update or to change the settings:
     /// it stops the running daemon first.
-    pub fn install(&mut self, settings: &Settings) -> Result<(), String> {
+    pub fn install(&mut self, given: &Given) -> Result<(), String> {
         let began = winfs::real_now();
         let bin = self.bin_dir().ok_or("USERPROFILE is not set")?;
         let sandboxed = self.sys.sandboxed(self.env.localappdata.as_deref());
@@ -718,6 +831,27 @@ impl Setup<'_> {
                 ));
             }
         }
+
+        // The settings: what is given now, over what the previous install was given. That is on
+        // record in the state folder; an install from before it was kept there is asked through
+        // its scheduled task, while that is still the old one.
+        let home = self.paths.home.clone();
+        let previous = load_settings(&home).or_else(|| {
+            let asked = self
+                .sys
+                .run_output("schtasks", &strs(&["/Query", "/TN", TASK_NAME, "/XML"]));
+            match asked {
+                Ok((0, xml)) => settings_from_task(&xml),
+                _ => None,
+            }
+        });
+        let base = previous.clone().unwrap_or_default();
+        let settings = &Settings {
+            interval: given.interval.unwrap_or(base.interval).max(60),
+            quick: given.quick.unwrap_or(base.quick).max(0),
+            days: given.days.unwrap_or(base.days),
+            delete_sync: given.delete_sync.unwrap_or(base.delete_sync),
+        };
 
         // A daemon that is already running keeps the old program and settings. Ask it to finish
         // what it is doing and exit; only if it does not, end the task by force.
@@ -829,6 +963,7 @@ impl Setup<'_> {
             }
         };
 
+        let saved = save_settings(&home, settings);
         let on_path = self.set_path(&bin, true, sandboxed);
 
         // Do not report success unless THIS version really came up (a crash at start leaves
@@ -865,6 +1000,19 @@ impl Setup<'_> {
                 "are not"
             }
         ));
+        if previous.is_some() {
+            self.tell(if *given == Given::default() {
+                "             (kept from the previous install)"
+            } else {
+                "             (as given now; what was not given is kept from the previous install)"
+            });
+        }
+        if let Err(e) = &saved {
+            self.tell(&format!(
+                "             (they could not be put on record for the next install: {})",
+                e
+            ));
+        }
         self.tell(&format!("  Programs   {}", bin.display()));
         self.tell(&format!(
             "  Data       {}   (what it does: sync.log)",
@@ -1061,10 +1209,26 @@ impl Setup<'_> {
                 "nothing was purged: the daemon is still running. End it, then run uninstall --purge again.",
             ));
         }
-        let left = self.purge();
+        let mut left = self.purge();
         self.tell("Uninstalled and purged: this tool's log, journal, backups, quarantine, replaced versions");
         self.tell("and programs were deleted. The session records already copied into each account's folder");
         self.tell("are the app's own data and were not touched.");
+        // A program cannot delete itself while it runs: what is left of the programs is handed
+        // to a one-off task, which deletes it a few seconds from now.
+        let programs: Vec<PathBuf> = bin
+            .iter()
+            .flat_map(|b| [b.join(CONSOLE_EXE), b.join(WINDOWLESS_EXE)])
+            .collect();
+        if left.iter().any(|p| programs.contains(p)) {
+            if let Some(bin) = &bin {
+                if self.finish_later(bin).is_ok() {
+                    left.retain(|p| !programs.contains(p));
+                    self.tell("");
+                    self.tell("This program cannot delete itself while it runs: a one-off task deletes it, and its");
+                    self.tell("folder if nothing else is in it, a few seconds from now.");
+                }
+            }
+        }
         if !left.is_empty() {
             self.tell("");
             self.tell("Could NOT be deleted (in use):");
@@ -1078,6 +1242,51 @@ impl Setup<'_> {
                     self.tell(&format!("  rmdir /s /q \"{}\"", bin.display()));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Have a one-off task delete the installed programs once this one has ended: the two
+    /// programs by name, then their folder and the one above it, each only if it is empty by
+    /// then; last, the task deletes itself.
+    fn finish_later(&mut self, bin: &Path) -> Result<(), String> {
+        let user = task_user(self.env).ok_or("USERNAME is not set")?;
+        let base = bin.parent().ok_or("cannot tell where the programs are")?;
+        let script = format!(
+            "/c \"ping -n 4 127.0.0.1 >nul & del /f /q \"{}\" \"{}\" & rmdir \"{}\" & rmdir \"{}\" & schtasks /Delete /TN \"{}\" /F\"",
+            bin.join(CONSOLE_EXE).display(),
+            bin.join(WINDOWLESS_EXE).display(),
+            bin.display(),
+            base.display(),
+            SETUP_TASK_NAME
+        );
+        let xml = setup_task_xml(Path::new("cmd.exe"), &script, None, &user);
+        let xml_path = base.join("setup-task.xml");
+        fs::write(&xml_path, utf16_file(&xml)).map_err(|e| e.to_string())?;
+        let created = self.sys.run(
+            "schtasks",
+            &[
+                "/Create".to_string(),
+                "/TN".to_string(),
+                SETUP_TASK_NAME.to_string(),
+                "/XML".to_string(),
+                xml_path.to_string_lossy().into_owned(),
+                "/F".to_string(),
+            ],
+        );
+        let _ = fs::remove_file(&xml_path);
+        if !created.is_ok_and(|c| c == 0) {
+            return Err(String::from("the one-off task could not be registered"));
+        }
+        let started = self
+            .sys
+            .run("schtasks", &strs(&["/Run", "/TN", SETUP_TASK_NAME]));
+        if !started.is_ok_and(|c| c == 0) {
+            let _ = self.sys.run(
+                "schtasks",
+                &strs(&["/Delete", "/TN", SETUP_TASK_NAME, "/F"]),
+            );
+            return Err(String::from("the one-off task could not be started"));
         }
         Ok(())
     }

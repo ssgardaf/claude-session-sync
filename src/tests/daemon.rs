@@ -175,6 +175,7 @@ fn test_cli_smoke() {
     assert_eq!(main(&b, &["sync"]), 0);
     assert!(b.has(B, "s1"));
     assert!(!b.has(C, "s1")); // never signed in to
+    assert_eq!(main(&b, &["resolve", "--all"]), 0); // (no conflicts: nothing to do, and no failure)
     assert_eq!(main(&b, &["status"]), 1); // no daemon in the test
     assert_eq!(main(&b, &["stop"]), 0);
     assert_eq!(main(&b, &["restore", "nothing"]), 1);
@@ -187,7 +188,13 @@ fn test_cli_smoke() {
 #[test]
 fn test_bad_arguments_without_a_console_are_logged_not_lost() {
     let b = Base::new();
-    assert_eq!(main(&b, &["--no-such-option"]), 2);
+    // with a console, the complaint is on the console and nowhere else
+    let (code, said) = command_line(&b, &["--no-such-option"]);
+    assert_eq!(code, 2);
+    assert!(said.contains("unknown option '--no-such-option'") && said.contains("--help"));
+    assert!(!b.home.exists());
+    // the program without a console window leaves it in the log
+    assert_eq!(command_line_windowless(&b, &["--no-such-option"]).0, 2);
     assert!(fs::read_to_string(b.home.join("sync.log"))
         .unwrap()
         .contains("bad arguments"));
@@ -282,4 +289,76 @@ fn test_one_off_apply_steps_aside_for_a_running_daemon() {
     assert!(!b.has(B, "s1"));
     assert_eq!(main(&b, &["undo", "--since", "2000-01-01"]), 1);
     release_lock(held);
+}
+
+#[test]
+fn sync_says_by_its_exit_code_when_it_did_not_go_well() {
+    // an item fails
+    let b = Base::new();
+    b.write_log(&[
+        &at("09:00:00", Some(A)),
+        &at("10:00:00", None),
+        &at("10:00:05", Some(B)),
+        &at("11:00:00", None),
+    ]);
+    b.rec(A, "s1", r());
+    b.rec(B, "own", r());
+    fs::create_dir_all(b.path(B, "s1")).unwrap(); // a folder where B's record should be
+    set_mtime(&b.path(B, "s1"), now() - HOUR);
+    let (code, said) = command_line(&b, &["sync"]);
+    assert_eq!(code, 1);
+    assert!(said.contains("failed 1"));
+    // the pass cannot be made at all
+    let b = Base::new();
+    b.write_log(&[
+        &at("09:00:00", Some(A)),
+        &at("10:00:00", None),
+        &at("10:00:05", Some(B)),
+        &at("11:00:00", None),
+    ]);
+    b.rec(A, "s1", r());
+    b.rec(B, "own", r());
+    fs::create_dir_all(&b.home).unwrap();
+    fs::write(b.home.join("backups"), b"").unwrap(); // no backup can be made
+    let (code, said) = command_line(&b, &["sync"]);
+    assert_eq!(code, 1);
+    assert!(said.contains("pass aborted before writing"));
+    // all well
+    let b = Base::new();
+    b.write_log(&[
+        &at("09:00:00", Some(A)),
+        &at("10:00:00", None),
+        &at("10:00:05", Some(B)),
+        &at("11:00:00", None),
+    ]);
+    b.rec(A, "s1", r());
+    b.rec(B, "own", r());
+    assert_eq!(command_line(&b, &["sync"]).0, 0);
+    assert_eq!(command_line(&b, &["sync"]).0, 0);
+}
+
+#[test]
+fn store_that_is_not_there_is_said_with_where_it_was_looked_for() {
+    let b = Base::new();
+    fs::remove_dir_all(b.tmp.join("appdata")).unwrap();
+    for what in ["preview", "status"] {
+        let (_, said) = command_line(&b, &[what]);
+        assert!(
+            said.contains("session store was not found. Looked for:"),
+            "{}",
+            said
+        );
+        assert!(
+            said.contains(&format!("  {}", b.root.display())),
+            "{}",
+            said
+        );
+        assert!(said.contains("CLAUDE_SESSION_SYNC_STORE"), "{}", said);
+        assert!(said.contains("account folders: 0"));
+    }
+    // (for status, the summary is still the first line)
+    assert!(command_line(&b, &["status"]).1.starts_with("NOT RUNNING"));
+    // where there is a store, nothing of the kind is said
+    let b = Base::new();
+    assert!(!command_line(&b, &["preview"]).1.contains("not found"));
 }

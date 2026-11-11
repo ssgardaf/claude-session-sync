@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::consts::*;
 use crate::plan::{Act, Kind, Plan};
 use crate::pyjson::{self, J};
-use crate::sync::{past, sha256_hex, short, Sync};
+use crate::sync::{past, sha256_hex, short, Signed, Sync};
 use crate::winfs::{self, path_str, Expect, Stat, WriteError};
 
 /// What became of one planned item.
@@ -222,10 +222,30 @@ impl Sync {
         self.now() - st.mtime()
     }
 
+    /// How recent a change by something else must be for a file to be left alone for now.
+    /// Holding off for two minutes only makes sense while the app may be writing in that
+    /// folder. When it is not running, is signed out, or has another folder loaded, nothing but
+    /// a save still in progress can be in the way, and that is over in seconds. (The Python
+    /// version always waited the two minutes: a session used under one account could then
+    /// reach the account the user had just come from too late.)
+    fn fresh_window(&mut self, leaf: &str) -> f64 {
+        if !self.app_running() {
+            return SRC_SETTLE_SEC;
+        }
+        match self.signed_in() {
+            Signed::Out => SRC_SETTLE_SEC,
+            Signed::In(at) if at != leaf => SRC_SETTLE_SEC,
+            _ => APP_FRESH_SEC, // loaded here, or no telling where
+        }
+    }
+
     /// True if something other than this tool changed the file very recently.
-    fn app_is_writing(&mut self, path: &Path, st: &Stat) -> bool {
+    fn app_is_writing(&mut self, leaf: &str, path: &Path, st: &Stat) -> bool {
         let age = self.age(st);
-        !self.is_ours(path, st) && (-2.0..APP_FRESH_SEC).contains(&age)
+        if self.is_ours(path, st) || age < -2.0 {
+            return false;
+        }
+        age < self.fresh_window(leaf)
     }
 
     /// Keep a version this tool did not write before it is replaced. An error means it could not.
@@ -319,7 +339,7 @@ impl Sync {
         let sha = sha256_hex(&data)[..32].to_string();
         let mut saved: Option<PathBuf> = None;
         if let Some(ds) = &dst_st {
-            if self.app_is_writing(&dst, ds) {
+            if self.app_is_writing(&act.leaf, &dst, ds) {
                 return Ok(Outcome::Deferred);
             }
             if act.kind == Kind::Update
@@ -421,7 +441,7 @@ impl Sync {
             .ok_or_else(|| String::from("nothing to remove"))?;
         let st = winfs::stat(&r.path).map_err(e2s)?;
         if Some((st.mtime_ns, st.size)) != act.expect
-            || self.app_is_writing(&r.path, &st)
+            || self.app_is_writing(&act.leaf, &r.path, &st)
             || self.in_use_now(&act.leaf)
         {
             return Ok(Outcome::Deferred);
@@ -634,6 +654,7 @@ impl Sync {
         self.aborted = false;
         let result = (|| -> Result<Counts, String> {
             let done = self.apply(&plan.acts)?;
+            self.save_vanished().map_err(e2s)?;
             if !self.plan_requests.is_empty() {
                 self.close_requests().map_err(e2s)?; // a resolve with nothing left to settle is done with
             }

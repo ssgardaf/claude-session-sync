@@ -135,6 +135,7 @@ impl Sync {
             ("conflicts", json!(self.notes.conflicts.len())),
             ("retrying", json!(self.retry.len())),
             ("delete_sync", json!(self.delete_sync)),
+            ("days", crate::sync::num_json(self.days)),
             ("last_error", json!(self.last_error)),
         ];
         self.write_status(&fields);
@@ -365,6 +366,35 @@ pub fn acquire_lock(home: &Path) -> io::Result<Option<Lock>> {
         return Ok(None);
     }
     Ok(Some(Lock { file }))
+}
+
+/// Does a daemon (or anything else) hold the lock right now? Unlike `acquire_lock`, this
+/// creates nothing: where there is no lock file, nothing is running.
+pub fn is_running(home: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).open(home.join("daemon.lock")) else {
+        return false;
+    };
+    let mut range = first_byte();
+    // SAFETY: as in `acquire_lock`.
+    let got = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut range,
+        )
+    };
+    if got == 0 {
+        return true;
+    }
+    let mut range = first_byte();
+    // SAFETY: as above; the lock just taken is given back.
+    unsafe {
+        UnlockFileEx(file.as_raw_handle() as _, 0, 1, 0, &mut range);
+    }
+    false
 }
 
 impl Drop for Lock {

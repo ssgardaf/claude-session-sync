@@ -136,3 +136,61 @@ fn test_sign_out_starts_a_pass_at_once() {
     assert_eq!(seen, vec![String::from("sesión")]); // held while B was loaded
     assert_eq!(b.title(B, "s1"), "newer, from A"); // brought up to date the moment it was not
 }
+
+#[test]
+fn session_used_in_another_account_reaches_the_one_just_left_within_seconds() {
+    // What a reviewer did: saved a session under account A, switched to B and used the same
+    // session there 22 s later, and was back in A 12 s after that. A's own file is then half a
+    // minute old. Waiting two minutes "because the app wrote it a moment ago" would leave A
+    // with the old state when the user arrives; the app cannot be writing in A while it has
+    // B loaded.
+    let b = Base::new();
+    b.rec(A, "s1", r().last(34.0).mtime(34.0).title("as A left it"));
+    b.rec(B, "s1", r().last(12.0).mtime(12.0).title("went on in B"));
+    let done = b.s_app(true, Signed::In(lb())).run();
+    assert_eq!((done.update, done.deferred), (1, 0));
+    assert_eq!(b.title(A, "s1"), "went on in B");
+    assert_eq!(b.kept().len(), 1); // what A had is kept, as always
+}
+
+#[test]
+fn file_another_program_just_wrote_is_waited_on_only_while_the_app_may_be_writing_there() {
+    // A's file was written 30 s ago by the app; a more advanced copy is in B
+    let scene = || {
+        let b = Base::new();
+        b.rec(A, "s1", r().last(34.0).mtime(30.0).title("as A left it"));
+        b.rec(B, "s1", r().last(12.0).mtime(12.0).title("went on in B"));
+        b.rec(C, "other", r().last(5.0).mtime(5.0)); // (the latest write of all is in C)
+        b
+    };
+    // the app is not running, is signed out, or has another folder loaded: a few seconds are enough
+    for (app, signed) in [
+        (false, Signed::Unknown),
+        (true, Signed::Out),
+        (true, Signed::In(lb())),
+        (true, Signed::In(lc())),
+    ] {
+        let b = scene();
+        let done = b.s_app(app, signed.clone()).run();
+        assert_eq!(b.title(A, "s1"), "went on in B", "{:?}", signed);
+        assert_eq!(done.deferred, 0, "{:?}", signed);
+    }
+    // it is running and there is no telling where it is: two minutes, as before
+    let b = scene();
+    let done = b.s_app(true, Signed::Unknown).run();
+    assert_eq!(b.title(A, "s1"), "as A left it");
+    assert!(done.deferred >= 1);
+    // it has that very folder loaded: its records are not touched at all
+    let b = scene();
+    let mut s = b.s_app(true, Signed::In(la()));
+    assert_eq!(s.plan().notes.held.len(), 1);
+    s.run();
+    assert_eq!(b.title(A, "s1"), "as A left it");
+    // and a save that may still be going on is waited for in any case
+    let b = Base::new();
+    b.rec(A, "s1", r().last(34.0).mtime(1.0));
+    b.rec(B, "s1", r().last(12.0).mtime(12.0));
+    let behind = b.data(A, "s1");
+    assert_eq!(b.s_app(true, Signed::In(lb())).run().deferred, 1);
+    assert_eq!(b.data(A, "s1"), behind);
+}

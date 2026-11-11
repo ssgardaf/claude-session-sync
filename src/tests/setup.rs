@@ -19,7 +19,20 @@ type Start = Box<dyn FnMut()>;
 type Answer = Box<dyn FnMut(&str)>;
 type Held = Rc<RefCell<Option<Lock>>>;
 
-fn task_definition(enabled: bool) -> String {
+fn task_definition(enabled: bool, arguments: &str) -> String {
+    let definition = task_definition_without_action(enabled);
+    if arguments.is_empty() {
+        return definition;
+    }
+    let action = format!(
+        "  <Actions Context=\"Author\">\r\n    <Exec>\r\n      <Command>C:\\x\\daemon.exe</Command>\r\n      \
+         <Arguments>{}</Arguments>\r\n    </Exec>\r\n  </Actions>\r\n</Task>",
+        arguments.replace('&', "&amp;").replace('"', "&quot;")
+    );
+    definition.replace("</Task>", &action)
+}
+
+fn task_definition_without_action(enabled: bool) -> String {
     // as `schtasks /Query /XML` prints it: the triggers have an Enabled of their own
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task>\r\n  <Triggers>\r\n    <LogonTrigger>\r\n      \
@@ -38,6 +51,8 @@ struct Recorder {
     on_start: Option<Start>,
     /// The scheduled task, if it is registered: is it enabled.
     task: Option<bool>,
+    /// The arguments of the daemon that task starts (empty: the definition shows none).
+    arguments: String,
     run_entry: bool,
     ours: Vec<u32>,
     asked: Vec<(u32, Option<f64>)>,
@@ -65,6 +80,7 @@ impl Recorder {
             refuse: Vec::new(),
             on_start: None,
             task: None,
+            arguments: String::new(),
             run_entry: false,
             ours: Vec::new(),
             asked: Vec::new(),
@@ -163,7 +179,7 @@ impl System for Recorder {
             }
             ("schtasks", "/Query") => match self.task {
                 Some(enabled) => {
-                    out = task_definition(enabled);
+                    out = task_definition(enabled, &self.arguments);
                     0
                 }
                 None => 1,
@@ -247,6 +263,20 @@ impl System for Recorder {
     }
 }
 
+/// Have the app's log say it has been in A and in B and is signed out now, so that what the
+/// command line sees (it uses the real defaults) does not depend on a desktop app running here.
+fn signed_out(b: &Base) {
+    use super::homes::at;
+    b.write_log(&[
+        &at("09:00:00", Some(A)),
+        &at("10:00:00", None),
+        &at("10:00:05", Some(B)),
+        &at("11:00:00", None),
+        &at("11:00:05", Some(C)),
+        &at("12:00:00", None),
+    ]);
+}
+
 /// A folder with stand-ins for the two programs, as a download would have them.
 fn programs(b: &Base) -> PathBuf {
     let dir = b.tmp.join("download");
@@ -291,10 +321,20 @@ fn act(
         say: &mut say,
     };
     let result = match what {
-        "install" => setup.install(&Settings::default()),
-        "install --delete-sync" => setup.install(&Settings {
-            delete_sync: true,
-            ..Settings::default()
+        "install" => setup.install(&Given::default()),
+        "install --delete-sync" => setup.install(&Given {
+            delete_sync: Some(true),
+            ..Given::default()
+        }),
+        "install --no-delete-sync" => setup.install(&Given {
+            delete_sync: Some(false),
+            ..Given::default()
+        }),
+        "install --interval 600 --quick 0 --days 90 --delete-sync" => setup.install(&Given {
+            interval: Some(600),
+            quick: Some(0),
+            days: Some(90),
+            delete_sync: Some(true),
         }),
         "uninstall" => setup.uninstall(false),
         "uninstall --purge" => setup.uninstall(true),
@@ -365,7 +405,7 @@ fn daemon_arguments_follow_the_settings() {
             quick: 0
         }
     );
-    assert_eq!((parsed.days, parsed.delete_sync), (90, true));
+    assert_eq!((parsed.days, parsed.delete_sync), (Some(90), Some(true)));
 }
 
 #[test]
@@ -491,10 +531,13 @@ fn task_runs_as_the_current_user() {
 
 #[test]
 fn a_disabled_task_is_told_from_a_disabled_trigger() {
-    assert!(!task_is_disabled(&task_definition(true)));
-    assert!(task_is_disabled(&task_definition(false)));
-    let trigger_off =
-        task_definition(true).replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 1);
+    assert!(!task_is_disabled(&task_definition(true, "")));
+    assert!(task_is_disabled(&task_definition(false, "")));
+    let trigger_off = task_definition(true, "").replacen(
+        "<Enabled>true</Enabled>",
+        "<Enabled>false</Enabled>",
+        1,
+    );
     assert!(!task_is_disabled(&trigger_off));
     assert!(!task_is_disabled("not a task definition"));
 }
@@ -697,7 +740,7 @@ fn install_falls_back_to_the_watchdog_alone_and_then_to_a_start_up_entry() {
         sys: &mut once,
         say: &mut say,
     }
-    .install(&Settings::default());
+    .install(&Given::default());
     assert_eq!(result, Ok(()));
     let creates: Vec<&String> = once
         .0
@@ -1068,23 +1111,65 @@ fn purge_deletes_this_tools_own_files_and_nothing_else() {
     assert!(b.tmp.join("download").join(CONSOLE_EXE).exists()); // nor is the copy that was run
 }
 
-#[test]
-fn purge_leaves_what_is_not_ours_and_says_what_it_could_not_delete() {
-    let b = Base::new();
+/// A state folder with something in it that is not this tool's, and the programs installed,
+/// one of them "running" (held open here without leave to delete, as a running program is).
+fn purge_scene(b: &Base) -> (PathBuf, fs::File) {
     b.rec(A, "s1", r());
     b.s().run();
-    fs::write(b.home.join("notes of my own.txt"), b"keep me").unwrap(); // someone else's file in the folder
-    fs::create_dir_all(bin(&b)).unwrap();
-    let exe = bin(&b).join(CONSOLE_EXE);
+    fs::write(b.home.join("notes of my own.txt"), b"keep me").unwrap();
+    fs::create_dir_all(bin(b)).unwrap();
+    let exe = bin(b).join(CONSOLE_EXE);
     fs::write(&exe, b"x").unwrap();
-    fs::write(bin(&b).join(WINDOWLESS_EXE), b"x").unwrap();
-    // the program that is running cannot be deleted: held open here, without leave to delete
+    fs::write(bin(b).join(WINDOWLESS_EXE), b"x").unwrap();
     let in_use = fs::OpenOptions::new()
         .read(true)
         .share_mode(0x1)
         .open(&exe)
         .unwrap();
+    (exe, in_use)
+}
+
+#[test]
+fn purge_hands_the_running_program_to_a_one_off_task() {
+    let b = Base::new();
+    let (exe, in_use) = purge_scene(&b);
     let mut sys = Recorder::installed();
+    let (result, said) = act(&b, &mut sys, exe.clone(), "uninstall --purge");
+    assert_eq!(result, Ok(()));
+    // what could be deleted here was; what is not this tool's is still there
+    assert_eq!(listdir(&b.home), vec!["bin", "notes of my own.txt"]);
+    assert_eq!(listdir(&bin(&b)), vec![CONSOLE_EXE]);
+    // the rest is left to a task that waits a few seconds, deletes the two programs by name,
+    // removes the folders only if they are empty by then, and then deletes itself
+    let create = &sys.ran[sys.position("schtasks /Create /TN Claude Session Sync (setup) /XML")];
+    assert!(create.contains("<Command>cmd.exe</Command>"));
+    let script = format!(
+        "<Arguments>/c &quot;ping -n 4 127.0.0.1 &gt;nul &amp; del /f /q &quot;{0}\\{1}&quot; &quot;{0}\\{2}&quot; &amp; rmdir &quot;{0}&quot; &amp; rmdir &quot;{3}&quot; &amp; schtasks /Delete /TN &quot;Claude Session Sync (setup)&quot; /F&quot;</Arguments>",
+        bin(&b).display(),
+        CONSOLE_EXE,
+        WINDOWLESS_EXE,
+        b.home.display()
+    );
+    assert!(create.contains(&script), "{}", create);
+    assert!(!create.contains("rmdir /s")); // no folder is deleted with what may be in it
+    assert!(!create.contains("WorkingDirectory")); // (it must not sit in the folder it removes)
+    assert!(create.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+    assert_eq!(
+        sys.ran.last().unwrap(),
+        "schtasks /Run /TN Claude Session Sync (setup)"
+    ); // started, and left to finish by itself
+    assert!(!b.home.join("setup-task.xml").exists());
+    assert!(says(&said, "a one-off task deletes it"));
+    assert!(!says(&said, "Could NOT be deleted") && !says(&said, "rmdir /s /q"));
+    drop(in_use);
+}
+
+#[test]
+fn purge_says_what_it_could_not_delete_when_the_one_off_task_cannot_be_used() {
+    let b = Base::new();
+    let (exe, in_use) = purge_scene(&b);
+    let mut sys = Recorder::installed();
+    sys.setup_refused = true;
     let (result, said) = act(&b, &mut sys, exe.clone(), "uninstall --purge");
     assert_eq!(result, Ok(()));
     assert_eq!(listdir(&b.home), vec!["bin", "notes of my own.txt"]);
@@ -1099,6 +1184,10 @@ fn purge_leaves_what_is_not_ours_and_says_what_it_could_not_delete() {
         &said,
         &format!("rmdir /s /q \"{}\"", bin(&b).display())
     )); // that folder, not the one with the notes
+    assert_eq!(
+        sys.count("schtasks /Run /TN Claude Session Sync (setup)"),
+        0
+    );
     drop(in_use);
 }
 
@@ -1395,7 +1484,7 @@ fn assert_setup_ran(b: &Base, ran: &[String], what: &str) {
 #[test]
 fn one_off_task_has_no_trigger_and_starts_on_battery() {
     let exe = Path::new(r"C:\Users\R&D\.claude-session-sync\bin\claude-session-syncw.exe");
-    let xml = setup_task_xml(exe, "__path add", exe.parent().unwrap(), r"PC\someone");
+    let xml = setup_task_xml(exe, "__path add", exe.parent(), r"PC\someone");
     for part in [
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
         "<Triggers />",
@@ -1430,10 +1519,11 @@ fn inside_the_app_the_path_is_set_through_a_one_off_task() {
     assert_eq!(sys.count("reg "), 0);
     // the daemon's task is registered and started as ever; then the one-off task is
     // registered, run and deleted again
-    assert_eq!(sys.ran.len(), 5);
-    assert!(sys.ran[0].starts_with("schtasks /Create /TN Claude Session Sync /XML"));
-    assert_eq!(sys.ran[1], "schtasks /Run /TN Claude Session Sync");
-    assert_setup_ran(&b, &sys.ran[2..], "add");
+    assert_eq!(sys.ran.len(), 6);
+    assert_eq!(sys.ran[0], "schtasks /Query /TN Claude Session Sync /XML"); // (settings to keep?)
+    assert!(sys.ran[1].starts_with("schtasks /Create /TN Claude Session Sync /XML"));
+    assert_eq!(sys.ran[2], "schtasks /Run /TN Claude Session Sync");
+    assert_setup_ran(&b, &sys.ran[3..], "add");
     assert!(sys.setup_task.is_none());
     assert!(!b.home.join(PATH_RESULT).exists()); // its answer was read and cleared away
     assert!(says(&said, "added to your PATH: open a NEW terminal"));
@@ -1488,7 +1578,7 @@ fn one_off_task_that_fails_or_does_not_answer_is_said_and_the_install_stands() {
             &format!("\"{}\" status", bin(&b).join(CONSOLE_EXE).display())
         ));
         // the one-off task is not left behind, nor its answer
-        assert_setup_ran(&b, &sys.ran[2..], "add");
+        assert_setup_ran(&b, &sys.ran[3..], "add");
         assert!(sys.setup_task.is_none() && !b.home.join(PATH_RESULT).exists());
         if told.contains("15 seconds") {
             assert!(sys.slept >= 15.0);
@@ -1720,4 +1810,393 @@ fn hidden_path_command_is_understood_and_not_advertised() {
         assert!(parse(bad).is_err(), "{:?}", bad);
     }
     assert!(!cli::help().contains("__path"));
+}
+
+// ---------------------------------------------------------------------- settings that are kept
+
+fn arguments_registered(sys: &Recorder) -> String {
+    let create = sys
+        .ran
+        .iter()
+        .rev()
+        .find(|c| c.starts_with("schtasks /Create /TN Claude Session Sync /XML"))
+        .unwrap();
+    let start = create.find("<Arguments>").unwrap() + "<Arguments>".len();
+    let end = create.find("</Arguments>").unwrap();
+    create[start..end].to_string()
+}
+
+fn install_again(b: &Base, sys: &mut Recorder, what: &str) -> Vec<String> {
+    let (start, held) = daemon_comes_up(b, VERSION, 0.0);
+    sys.on_start = Some(start);
+    let exe = programs(b);
+    let (result, said) = act(b, sys, exe, what);
+    assert_eq!(result, Ok(()), "{}", what);
+    sys.on_start = None;
+    drop(held);
+    said
+}
+
+#[test]
+fn install_keeps_the_settings_of_the_install_before() {
+    let b = Base::new();
+    let mut sys = Recorder::new();
+    let given = "install --interval 600 --quick 0 --days 90 --delete-sync";
+    let said = install_again(&b, &mut sys, given);
+    assert_eq!(
+        arguments_registered(&sys),
+        "daemon --interval 600 --quick 0 --delete-sync --days 90"
+    );
+    assert!(says(
+        &said,
+        "full pass every 600 s, change check off, archived sessions up to 90 days old"
+    ));
+    assert!(says(&said, "deletions are carried over"));
+    assert!(!says(&said, "previous install")); // a first install: nothing to keep
+    assert_eq!(
+        load_settings(&b.home),
+        Some(Settings {
+            interval: 600,
+            quick: 0,
+            delete_sync: true,
+            days: 90
+        })
+    );
+    // an update: install again, saying nothing. Everything is as it was.
+    let before = sys.ran.len();
+    let said = install_again(&b, &mut sys, "install");
+    assert_eq!(
+        arguments_registered(&sys),
+        "daemon --interval 600 --quick 0 --delete-sync --days 90"
+    );
+    assert!(says(&said, "deletions are carried over"));
+    assert!(says(&said, "(kept from the previous install)"));
+    assert!(!sys.ran[before..].iter().any(|c| c.contains("/Query"))); // the record is enough
+                                                                      // one thing is changed: that one only
+    let said = install_again(&b, &mut sys, "install --no-delete-sync");
+    assert_eq!(
+        arguments_registered(&sys),
+        "daemon --interval 600 --quick 0 --days 90"
+    );
+    assert!(says(&said, "deletions are not carried over"));
+    assert!(says(
+        &said,
+        "(as given now; what was not given is kept from the previous install)"
+    ));
+    assert_eq!(
+        load_settings(&b.home).map(|s| (s.delete_sync, s.days)),
+        Some((false, 90))
+    );
+}
+
+#[test]
+fn install_takes_over_the_settings_of_an_install_that_left_no_record() {
+    // version 0.1.0 kept its settings in the scheduled task alone
+    let b = Base::new();
+    let mut sys = Recorder::installed();
+    sys.arguments = String::from("daemon --interval 3600 --quick 10 --delete-sync");
+    let said = install_again(&b, &mut sys, "install");
+    assert_eq!(sys.ran[0], "schtasks /Query /TN Claude Session Sync /XML"); // asked before anything is changed
+    assert_eq!(
+        arguments_registered(&sys),
+        "daemon --interval 3600 --quick 10 --delete-sync"
+    );
+    assert!(
+        says(&said, "deletions are carried over")
+            && says(&said, "(kept from the previous install)")
+    );
+    assert_eq!(load_settings(&b.home).map(|s| s.delete_sync), Some(true)); // on record from now on
+                                                                           // the Python version's task, with its own way of writing the same
+    let b = Base::new();
+    let mut sys = Recorder::installed();
+    sys.arguments = String::from(
+        "-I \"C:\\Users\\R&D\\sync.py\" --apply --watch --interval 1800 --quick 5 --delete-sync",
+    );
+    install_again(&b, &mut sys, "install");
+    assert_eq!(
+        arguments_registered(&sys),
+        "daemon --interval 1800 --quick 5 --delete-sync"
+    );
+    // a task that starts something else is no previous install
+    let b = Base::new();
+    let mut sys = Recorder::installed();
+    sys.arguments = String::from("--frobnicate --interval 5");
+    let said = install_again(&b, &mut sys, "install");
+    assert_eq!(
+        arguments_registered(&sys),
+        "daemon --interval 3600 --quick 10"
+    );
+    assert!(!says(&said, "previous install"));
+}
+
+#[test]
+fn settings_are_read_from_a_daemons_command_line() {
+    let read =
+        |a: &str| settings_from_arguments(a).map(|s| (s.interval, s.quick, s.days, s.delete_sync));
+    assert_eq!(read("daemon"), Some((3600, 10, 30, false)));
+    assert_eq!(
+        read("daemon --interval 600 --quick 0 --delete-sync --days 90"),
+        Some((600, 0, 90, true))
+    );
+    assert_eq!(
+        read("daemon --interval=120 --days=7 --delete-sync --no-delete-sync"),
+        Some((120, 10, 7, false))
+    );
+    assert_eq!(
+        read("daemon --interval soon --quick"),
+        Some((3600, 10, 30, false))
+    );
+    assert_eq!(read("sync --days 5"), None);
+    assert_eq!(read(""), None);
+    // whatever install registers can be read back
+    for s in [
+        Settings::default(),
+        Settings {
+            interval: 600,
+            quick: 0,
+            delete_sync: true,
+            days: 90,
+        },
+    ] {
+        assert_eq!(
+            settings_from_arguments(&daemon_arguments(&s)),
+            Some(s.clone())
+        );
+        let exe = Path::new(r"C:\bin\claude-session-syncw.exe");
+        let xml = task_xml(
+            exe,
+            &daemon_arguments(&s),
+            exe.parent().unwrap(),
+            "PC\\someone",
+            "2026-11-11T12:00:00",
+            true,
+        );
+        assert_eq!(settings_from_task(&xml), Some(s));
+    }
+    assert_eq!(settings_from_task("<Task></Task>"), None);
+    // a record that cannot be read is no record
+    let b = Base::new();
+    assert_eq!(load_settings(&b.home), None);
+    fs::create_dir_all(&b.home).unwrap();
+    fs::write(b.home.join(SETTINGS_FILE), b"not json").unwrap();
+    assert_eq!(load_settings(&b.home), None);
+    fs::write(b.home.join(SETTINGS_FILE), b"{\"days\": 45}").unwrap(); // what is missing is the default
+    assert_eq!(
+        load_settings(&b.home),
+        Some(Settings {
+            days: 45,
+            ..Settings::default()
+        })
+    );
+}
+
+#[test]
+fn command_line_looks_with_the_settings_the_daemon_was_installed_with() {
+    let b = Base::new();
+    signed_out(&b);
+    b.install(2.0 * HOUR, 0.0);
+    b.rec(B, "s1", r().cli("c1").last(HOUR));
+    b.rec(C, "own", r());
+    b.delete(A, "s1", 600.0, Some("c1")); // with deletions carried over, s1 is to leave B
+    let mut sys = Recorder::new();
+    // nothing installed: the defaults
+    let (_, out) = cli(&b, &mut sys, &["preview"]);
+    assert!(out.iter().any(|l| l.contains("older than 30 days")));
+    assert!(!out.iter().any(|l| l.ends_with("remove 1")));
+    // installed with 90 days and deletions carried over: preview and status see it so
+    save_settings(
+        &b.home,
+        &Settings {
+            days: 90,
+            delete_sync: true,
+            ..Settings::default()
+        },
+    )
+    .unwrap();
+    for what in ["preview", "status"] {
+        let (_, out) = cli(&b, &mut sys, &[what]);
+        assert!(
+            out.iter().any(|l| l.contains("older than 90 days")),
+            "{}",
+            what
+        );
+        assert!(out.iter().any(|l| l.ends_with("remove 1")), "{}", what);
+    }
+    // what is given on the command line counts for that command
+    let (_, out) = cli(
+        &b,
+        &mut sys,
+        &["preview", "--days", "5", "--no-delete-sync"],
+    );
+    assert!(out.iter().any(|l| l.contains("older than 5 days")));
+    assert!(!out.iter().any(|l| l.ends_with("remove 1")));
+    // a daemon at work is believed over the record: it reports what it runs with
+    let held = acquire_lock(&b.home).unwrap().unwrap();
+    let st = json!({"pid": 4242, "version": VERSION, "heartbeat": now() as i64, "delete_sync": false, "days": 7});
+    fs::write(b.home.join("status.json"), st.to_string()).unwrap();
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(out.iter().any(|l| l.contains("older than 7 days")));
+    assert!(!out.iter().any(|l| l.ends_with("remove 1")));
+    drop(held);
+    // and sync does what the daemon would
+    let (code, out) = cli(&b, &mut sys, &["sync"]);
+    assert_eq!(code, 0);
+    assert!(out.iter().any(|l| l.contains("removed 1")), "{:?}", out);
+    assert!(!b.has(B, "s1"));
+}
+
+// ---------------------------------------------------------------------- what status and resolve say
+
+#[test]
+fn refreshes_of_sessions_in_use_do_not_read_as_changes_in_waiting() {
+    let b = Base::new();
+    b.rec(A, "s1", r().last(600.0).mtime(300.0));
+    b.s().run(); // B and C hold copies this tool placed
+    b.rec(
+        A,
+        "s1",
+        r().last(200.0).mtime(100.0).title("in use, saved again"),
+    );
+    let mut sys = Recorder::installed();
+    // no daemon: the two copies are waiting for someone to bring them up to date
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(out.iter().any(|l| l == "2 change(s) pending"), "{:?}", out);
+    let (_, out) = cli(&b, &mut sys, &["preview"]);
+    assert!(out[0].ends_with("pending changes: 2"));
+    // a daemon is at work: it refreshes such copies once a minute, and nothing is amiss
+    let held = acquire_lock(&b.home).unwrap().unwrap();
+    let st = json!({"pid": 4242, "version": VERSION, "heartbeat": now() as i64});
+    fs::write(b.home.join("status.json"), st.to_string()).unwrap();
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 0);
+    assert!(out[0].starts_with("OK  "));
+    assert!(
+        out.iter()
+            .any(|l| l == "in sync (2 refreshes of sessions in use are due within a minute)"),
+        "{:?}",
+        out
+    );
+    let (_, out) = cli(&b, &mut sys, &["preview"]);
+    assert_eq!(
+        out[0],
+        "account folders: 3   sessions: 1   pending changes: 0   refreshes of sessions in use, due within a minute: 2"
+    );
+    // a change that is really waiting is still counted as one
+    b.rec(A, "s2", r());
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(
+        out.iter().any(|l| l
+            == "2 change(s) pending (and 2 refreshes of sessions in use are due within a minute)"),
+        "{:?}",
+        out
+    );
+    drop(held);
+    assert_eq!(
+        listdir(&b.home)
+            .iter()
+            .filter(|n| n.as_str() == "daemon.lock")
+            .count(),
+        1
+    );
+    // looking does not make a lock file where there is none
+    let b = Base::new();
+    b.rec(A, "s1", r());
+    cli(&b, &mut sys, &["preview"]);
+    assert!(!b.home.exists());
+}
+
+#[test]
+fn session_that_was_brought_back_is_no_longer_listed_as_removed() {
+    let b = Base::new();
+    b.install(2.0 * HOUR, 0.0);
+    for fid in ["abcdef-1", "ghijkl-2"] {
+        b.rec(B, fid, r().cli(&format!("c-{}", fid)).last(HOUR).title(fid));
+        b.delete(A, fid, 600.0, Some(&format!("c-{}", fid)));
+    }
+    b.s().run();
+    let mut sys = Recorder::new();
+    let listed = |out: &[String]| -> Vec<String> {
+        let at = out
+            .iter()
+            .position(|l| l.starts_with("removed from other accounts"));
+        let mut ids: Vec<String> = match at {
+            Some(at) => out[at + 1..]
+                .iter()
+                .take_while(|l| l.starts_with("  "))
+                .map(|l| l.split_whitespace().nth(2).unwrap().to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        ids.sort();
+        ids
+    };
+    let (_, out) = cli(&b, &mut sys, &["status", "--delete-sync"]);
+    assert_eq!(listed(&out), vec!["abcdef-1", "ghijkl-2"]);
+    assert_eq!(cli(&b, &mut sys, &["restore", "abcdef"]).0, 0);
+    let (_, out) = cli(&b, &mut sys, &["status", "--delete-sync"]);
+    assert_eq!(listed(&out), vec!["ghijkl-2"]);
+    assert_eq!(cli(&b, &mut sys, &["restore", "ghijkl"]).0, 0);
+    let (_, out) = cli(&b, &mut sys, &["status", "--delete-sync"]);
+    assert!(listed(&out).is_empty() && !out.iter().any(|l| l.starts_with("removed from")));
+}
+
+#[test]
+fn resolve_says_who_carries_it_out() {
+    let b = Base::new();
+    for fid in ["abcdef-1", "abcdef-2"] {
+        b.rec(
+            A,
+            fid,
+            r().last(3.0 * DAY)
+                .mtime(2.0 * DAY)
+                .archived()
+                .title("further along"),
+        );
+        b.rec(
+            B,
+            fid,
+            r().last(5.0 * DAY)
+                .mtime(DAY)
+                .title("older, un-archived later"),
+        );
+    }
+    let mut sys = Recorder::new();
+    // no daemon: it is for the user to run a pass
+    let (code, out) = cli(&b, &mut sys, &["resolve", "abcdef-1"]);
+    assert_eq!(code, 0);
+    assert!(out
+        .last()
+        .unwrap()
+        .contains("run `claude-session-sync sync` (or start the daemon) to carry it out"));
+    // too little to go by
+    let (code, out) = cli(&b, &mut sys, &["resolve", "abc"]);
+    assert_eq!(code, 1);
+    assert!(out
+        .iter()
+        .any(|l| l.contains("at least its first 6 characters")));
+    assert!(!out.iter().any(|l| l.contains("carry it out")));
+    // a daemon is running: it will
+    let held = acquire_lock(&b.home).unwrap().unwrap();
+    let (code, out) = cli(&b, &mut sys, &["resolve", "--all"]);
+    assert_eq!(code, 0);
+    // (the one asked for above is a conflict no longer: it is waiting to be carried out)
+    assert!(
+        out.iter().any(|l| l == "1 conflict to be settled"),
+        "{:?}",
+        out
+    );
+    assert!(out
+        .last()
+        .unwrap()
+        .starts_with("the daemon carries it out on its next pass"));
+    drop(held);
+    assert_eq!(b.state()["resolve"].as_object().unwrap().len(), 2);
+    // nothing in conflict
+    let b = Base::new();
+    b.rec(A, "s1", r());
+    let (code, out) = cli(&b, &mut sys, &["resolve", "--all"]);
+    assert_eq!(
+        (code, out),
+        (0, vec![String::from("there are no conflicts to settle")])
+    );
 }

@@ -51,6 +51,15 @@ fn matches_key(fid: &str, key: &str) -> bool {
     fid == key || (key.chars().count() >= 6 && fid.starts_with(key))
 }
 
+/// What to add to "nothing matches" when too little of an id was given to go by.
+fn too_short(key: &str) -> &'static str {
+    if key.chars().count() < 6 {
+        " (give the whole session id, or at least its first 6 characters)"
+    } else {
+        ""
+    }
+}
+
 fn text<'a>(e: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
     e.get(key)
         .and_then(Value::as_str)
@@ -122,6 +131,13 @@ impl Sync {
                             }
                         }
                     }
+                }
+                // The deletion was carried over, and now it is taken back: its marker in the
+                // account it was made in is still there, and must not carry it over again.
+                if let (Some(fid), Some(ts)) =
+                    (e.get("fid").and_then(Value::as_str), num(e.get("ts")))
+                {
+                    self.exempt(fid, ts).map_err(e2s)?;
                 }
                 done.put_back += 1;
             } else {
@@ -225,7 +241,7 @@ impl Sync {
             .collect();
         if fids.len() != 1 {
             let msg = if fids.is_empty() {
-                format!("no conflict matches '{}'", key)
+                format!("no conflict matches '{}'{}", key, too_short(key))
             } else {
                 format!(
                     "'{}' matches several: {}",
@@ -240,20 +256,45 @@ impl Sync {
             return Ok(None);
         }
         let fid = fids.into_iter().next().cloned().unwrap_or_default();
-        let mut st = self.state();
-        let mut asked = match st.get("resolve") {
-            Some(Value::Object(a)) => a.clone(),
-            _ => Map::new(),
-        };
-        asked.insert(fid.clone(), json!(self.now()));
-        st.insert("resolve".into(), Value::Object(asked));
-        self.write_state(&st)?;
-        self.journal(&[("kind", json!("resolve")), ("fid", json!(fid))])?;
+        self.request(std::slice::from_ref(&fid))?;
         self.log(&format!(
             "resolve {}: the most advanced copy will replace the others",
             fid.chars().take(8).collect::<String>()
         ));
         Ok(Some(fid))
+    }
+
+    /// Settle every conflict there is now. The sessions asked for.
+    pub fn resolve_all(&mut self) -> io::Result<Vec<String>> {
+        let plan = self.plan();
+        let fids: BTreeSet<String> = plan.notes.conflicts.iter().map(|c| c.3.clone()).collect();
+        let fids: Vec<String> = fids.into_iter().collect();
+        if !fids.is_empty() {
+            self.request(&fids)?;
+            self.log(&format!(
+                "resolve --all: for {} session(s) the most advanced copy will replace the others",
+                fids.len()
+            ));
+        }
+        Ok(fids)
+    }
+
+    /// Put resolve requests on record, for the next pass to carry out.
+    fn request(&mut self, fids: &[String]) -> io::Result<()> {
+        let mut st = self.state();
+        let mut asked = match st.get("resolve") {
+            Some(Value::Object(a)) => a.clone(),
+            _ => Map::new(),
+        };
+        for fid in fids {
+            asked.insert(fid.clone(), json!(self.now()));
+        }
+        st.insert("resolve".into(), Value::Object(asked));
+        self.write_state(&st)?;
+        for fid in fids {
+            self.journal(&[("kind", json!("resolve")), ("fid", json!(fid))])?;
+        }
+        Ok(())
     }
 
     /// Bring back a session whose copies were moved to quarantine: clear its deletion markers
@@ -289,7 +330,7 @@ impl Sync {
         })();
         if found.len() != 1 {
             let msg = if found.is_empty() {
-                format!("no quarantined session matches '{}'", key)
+                format!("no quarantined session matches '{}'{}", key, too_short(key))
             } else {
                 format!(
                     "'{}' matches several sessions: {}",
