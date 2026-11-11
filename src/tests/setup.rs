@@ -70,6 +70,8 @@ struct Recorder {
     /// What running the one-off task does (it is given the command).
     on_setup: Option<Answer>,
     setup_refused: bool,
+    /// Is the desktop app running, as far as the command line is to know.
+    app: bool,
 }
 
 impl Recorder {
@@ -94,6 +96,7 @@ impl Recorder {
             setup_task: None,
             on_setup: None,
             setup_refused: false,
+            app: false,
         }
     }
 
@@ -260,6 +263,10 @@ impl System for Recorder {
 
     fn sandboxed(&mut self, _localappdata: Option<&Path>) -> bool {
         self.sandboxed
+    }
+
+    fn app_running_override(&mut self) -> Option<bool> {
+        Some(self.app)
     }
 }
 
@@ -2198,5 +2205,126 @@ fn resolve_says_who_carries_it_out() {
     assert_eq!(
         (code, out),
         (0, vec![String::from("there are no conflicts to settle")])
+    );
+}
+
+// ---------------------------------------------------------------------- undo
+
+#[test]
+fn undo_wants_force_while_the_app_is_running() {
+    let b = Base::new();
+    signed_out(&b);
+    b.rec(A, "s1", r());
+    b.rec(B, "own", r());
+    let mut sys = Recorder::new();
+    assert_eq!(cli(&b, &mut sys, &["sync"]).0, 0);
+    assert!(b.has(B, "s1"));
+    // the app is running: nothing is undone, and it is said why and what to do
+    sys.app = true;
+    let (code, out) = cli(&b, &mut sys, &["undo", "--since", "2000-01-01"]);
+    assert_eq!(code, 1);
+    assert!(out[0].starts_with("The Claude app is running"));
+    assert!(
+        out.iter().any(|l| l.contains("Nothing was undone"))
+            && out.iter().any(|l| l.contains("--force"))
+    );
+    assert!(b.has(B, "s1"));
+    // told to go ahead: it does, with the warning
+    let (code, out) = cli(&b, &mut sys, &["undo", "--since", "2000-01-01", "--force"]);
+    assert_eq!(code, 0);
+    assert!(out[0].starts_with("The Claude app is running") && out[1].contains("--force"));
+    assert!(out.iter().any(|l| l.contains("undo since")));
+    assert!(!b.has(B, "s1"));
+    // the app is not running: no warning, no need to force
+    assert_eq!(cli(&b, &mut sys, &["sync"]).0, 0);
+    sys.app = false;
+    let (code, out) = cli(&b, &mut sys, &["undo", "--since", "2000-01-01"]);
+    assert_eq!(code, 0);
+    assert!(!out.iter().any(|l| l.contains("Claude app is running")));
+    assert!(!b.has(B, "s1"));
+    // a daemon at work comes first, as before
+    let held = acquire_lock(&b.home).unwrap().unwrap();
+    sys.app = true;
+    let (code, out) = cli(&b, &mut sys, &["undo", "--since", "2000-01-01", "--force"]);
+    assert_eq!(code, 1);
+    assert!(out[0].starts_with("the daemon is running"));
+    drop(held);
+}
+
+#[test]
+fn deletion_that_undo_took_back_is_no_longer_listed_as_removed() {
+    let b = Base::new();
+    signed_out(&b);
+    b.install(2.0 * HOUR, 0.0);
+    b.rec(B, "abcdef-1", r().cli("c1").last(HOUR));
+    b.delete(A, "abcdef-1", 600.0, Some("c1"));
+    let mut sys = Recorder::new();
+    let start = winfs::local_format(now() - 60.0, "%Y-%m-%d %H:%M:%S");
+    assert_eq!(cli(&b, &mut sys, &["sync", "--delete-sync"]).0, 0);
+    assert!(!b.has(B, "abcdef-1"));
+    let (_, out) = cli(&b, &mut sys, &["status", "--delete-sync"]);
+    assert!(out
+        .iter()
+        .any(|l| l.starts_with("removed from other accounts")));
+    assert_eq!(cli(&b, &mut sys, &["undo", "--since", &start]).0, 0);
+    assert!(b.has(B, "abcdef-1"));
+    let (_, out) = cli(&b, &mut sys, &["status", "--delete-sync"]);
+    assert!(
+        !out.iter()
+            .any(|l| l.starts_with("removed from other accounts")),
+        "{:?}",
+        out
+    );
+    assert!(out.iter().any(|l| l == "in sync")); // ...and it is not taken out again
+}
+
+#[test]
+fn conflict_settled_by_a_one_off_sync_and_undone_is_a_conflict_again() {
+    let b = Base::new();
+    signed_out(&b);
+    fs::remove_dir(b.dir(C)).unwrap(); // two accounts only: nothing but the conflict is in play
+    b.rec(
+        A,
+        "abcdef-1",
+        r().last(3.0 * DAY)
+            .mtime(2.0 * DAY)
+            .archived()
+            .title("further along"),
+    );
+    b.rec(
+        B,
+        "abcdef-1",
+        r().last(5.0 * DAY)
+            .mtime(DAY)
+            .title("older, un-archived later"),
+    );
+    let before = b.contents();
+    let mut sys = Recorder::new();
+    let start = winfs::local_format(now() - 60.0, "%Y-%m-%d %H:%M:%S");
+    assert_eq!(cli(&b, &mut sys, &["resolve", "--all"]).0, 0);
+    assert_eq!(cli(&b, &mut sys, &["sync"]).0, 0);
+    assert_eq!(b.title(B, "abcdef-1"), "further along");
+    assert_eq!(b.state()["resolve"], json!({})); // carried out, and closed in that very pass
+    assert_eq!(cli(&b, &mut sys, &["undo", "--since", &start]).0, 0);
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later");
+    // it is a conflict again, nothing is pending, and another pass leaves it alone
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(out[0].contains("| 1 conflict |"), "{}", out[0]);
+    assert!(out.iter().any(|l| l == "in sync"), "{:?}", out);
+    assert_eq!(cli(&b, &mut sys, &["sync"]).0, 0);
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later");
+    assert_eq!(
+        before.get(
+            Path::new(B.0)
+                .join(B.1)
+                .join("local_abcdef-1.json")
+                .as_path()
+        ),
+        b.contents().get(
+            Path::new(B.0)
+                .join(B.1)
+                .join("local_abcdef-1.json")
+                .as_path()
+        )
     );
 }

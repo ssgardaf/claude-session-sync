@@ -347,6 +347,7 @@ impl Sync {
         let overrides = self.overrides();
         self.plan_requests = overrides.clone();
         self.used = BTreeSet::new();
+        self.owed = BTreeSet::new();
         let mut acts: Vec<Act> = Vec::new();
         let mut gate = Gate {
             hold: &hold,
@@ -474,7 +475,8 @@ impl Sync {
                         continue;
                     }
                     let mut doubt = self.in_doubt(&best, cur);
-                    if doubt.is_some() && overrides.contains(fid) {
+                    let asked = doubt.is_some() && overrides.contains(fid);
+                    if asked {
                         // the user asked for this one to be settled
                         self.used.insert(fid.clone());
                         doubt = None;
@@ -496,6 +498,9 @@ impl Sync {
                             let due = pushed + REFRESH_SEC;
                             notes.next_refresh =
                                 Some(notes.next_refresh.map_or(due, |n| n.min(due)));
+                            if asked {
+                                self.owed.insert(fid.clone());
+                            }
                         } else {
                             acts.push(Act {
                                 kind: Kind::Update,
@@ -510,6 +515,9 @@ impl Sync {
                                 refresh: ours,
                             });
                         }
+                    } else if asked {
+                        // held, or backing off: the request stays until this copy has had its turn
+                        self.owed.insert(fid.clone());
                     }
                     continue;
                 }

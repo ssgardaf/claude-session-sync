@@ -563,6 +563,9 @@ impl Sync {
                     self.copy(a)?
                 };
                 done.bump(res);
+                if res == Outcome::Deferred && self.used.contains(&a.fid) {
+                    self.owed.insert(a.fid.clone()); // asked for, and not done yet
+                }
                 if res != Outcome::Deferred {
                     self.retry.remove(&key);
                     let now = self.now();
@@ -592,6 +595,9 @@ impl Sync {
             })();
             if let Err(e) = result {
                 done.failed += 1;
+                if self.used.contains(&a.fid) {
+                    self.owed.insert(a.fid.clone());
+                }
                 // this one item backs off; the rest carry on as usual
                 let fails = self.retry.get(&key).map_or(0, |slot| slot.0) + 1;
                 let wait = (15.0 * 2f64.powi(fails.min(6) as i32)).min(600.0);
@@ -623,9 +629,11 @@ impl Sync {
         Ok(done)
     }
 
-    /// Drop the requests the last plan looked at and found nothing left to settle for. One that
-    /// was only partly carried out (a copy in the folder the app has loaded must wait), or that
-    /// came in after that plan was made, stays.
+    /// Drop the requests that are done with: those the pass has just carried out in full, and
+    /// those the plan looked at and found nothing left to settle for. One that was only partly
+    /// carried out (a copy in the folder the app has loaded must wait), or that came in after
+    /// that plan was made, stays. (A request is closed in the very pass that carries it out,
+    /// so that an `undo` of that pass does not find it still standing and have it applied again.)
     pub(crate) fn close_requests(&mut self) -> io::Result<()> {
         let mut st = self.state();
         let asked = match st.get("resolve") {
@@ -634,7 +642,7 @@ impl Sync {
         };
         let keep: serde_json::Map<String, serde_json::Value> = asked
             .iter()
-            .filter(|(f, _)| self.used.contains(*f) || !self.plan_requests.contains(*f))
+            .filter(|(f, _)| self.owed.contains(*f) || !self.plan_requests.contains(*f))
             .map(|(f, t)| (f.clone(), t.clone()))
             .collect();
         if keep != asked {

@@ -104,6 +104,13 @@ impl Sync {
         let e2s = |err: io::Error| err.to_string();
         let kind = e.get("kind").and_then(Value::as_str).unwrap_or("");
         if kind == "restore" || kind == "resolve" {
+            // a request to settle a conflict that was made in the time now taken back is taken
+            // back with it, if it is still standing
+            if kind == "resolve" {
+                if let Some(fid) = e.get("fid").and_then(Value::as_str) {
+                    self.drop_request(fid).map_err(e2s)?;
+                }
+            }
             done.nothing_to_undo += 1;
             return Ok(());
         }
@@ -221,6 +228,10 @@ impl Sync {
                 Err(WriteError::Changed) => return Err(String::from("the destination changed")),
             }
             self.forget(&dst);
+            // the version that gave way is back: a request that would replace it again is void
+            if let Some(fid) = e.get("fid").and_then(Value::as_str) {
+                self.drop_request(fid).map_err(e2s)?;
+            }
             done.restored += 1;
         } else {
             done.nothing_to_undo += 1;

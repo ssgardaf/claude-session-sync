@@ -325,3 +325,41 @@ fn too_short_a_prefix_is_said_to_be_too_short() {
     );
     assert_eq!(b.s().resolve("s1").unwrap(), Some(String::from("s1")));
 }
+
+#[test]
+fn request_is_closed_in_the_pass_that_carries_it_out_and_undo_takes_it_back() {
+    // the daemon's path: the request is filed while it runs, and carried out on its next look
+    let b = Base::new();
+    conflict(&b, &[B]);
+    let start = now() - 1.0;
+    let mut daemon = b.s();
+    daemon.watch(3600.0, 1.0, POLL_SEC, Some(1), &mut |_| {}); // a first pass: the conflict stands
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later");
+    b.s().resolve("abcdef").unwrap();
+    FakeClock::at(&mut daemon, now() + 5.0);
+    daemon.watch(3600.0, 1.0, POLL_SEC, Some(1), &mut |_| {});
+    assert_eq!(b.title(B, "abcdef-1"), "further along");
+    assert_eq!(asked(&b), json!({})); // closed at once, not a pass later
+                                      // the user takes it back: the old copy returns, and it is a conflict as before
+    let undone = b.s().undo(start).unwrap();
+    assert_eq!(undone.restored, 1);
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later");
+    let mut daemon = b.s();
+    daemon.watch(3600.0, 1.0, POLL_SEC, Some(2), &mut |_| {});
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later");
+    assert_eq!(daemon.plan().notes.conflicts.len(), 1);
+    assert!(!daemon.something_due());
+    // a request that could not be carried out yet (the app has that folder loaded) is taken back
+    // by an undo of the time it was made in, so that it is not carried out later after all
+    let b = Base::new();
+    conflict(&b, &[B]);
+    let start = now() - 1.0;
+    let busy = || b.s_app(true, Signed::In(lb()));
+    busy().resolve("abcdef").unwrap();
+    assert_eq!(busy().run().update, 0);
+    assert!(asked(&b).get("abcdef-1").is_some());
+    b.s().undo(start).unwrap();
+    assert_eq!(asked(&b), json!({}));
+    assert_eq!(b.s_app(true, Signed::Out).run().update, 0);
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later");
+}

@@ -113,6 +113,9 @@ pub struct Sync {
     pub settling: usize,
     /// resolve requests the last plan made use of
     pub(crate) used: BTreeSet<String>,
+    /// ...and of those, the ones the pass has not carried out in full (a copy in the folder the
+    /// app has loaded, or one that was put off or failed, is still owed)
+    pub(crate) owed: BTreeSet<String>,
     /// fid -> since when its source has been too fresh to copy
     pub(crate) waiting: HashMap<String, f64>,
     pub(crate) meta: HashMap<PathBuf, Reading>,
@@ -237,6 +240,7 @@ impl Sync {
             plan_requests: BTreeSet::new(),
             settling: 0,
             used: BTreeSet::new(),
+            owed: BTreeSet::new(),
             waiting: HashMap::new(),
             meta: HashMap::new(),
             shas: HashMap::new(),
@@ -588,6 +592,18 @@ impl Sync {
                 .collect(),
             _ => HashMap::new(),
         }
+    }
+
+    /// Take a resolve request back, if there is one for that session.
+    pub(crate) fn drop_request(&mut self, fid: &str) -> io::Result<()> {
+        let mut st = self.state();
+        let Some(Value::Object(asked)) = st.get_mut("resolve") else {
+            return Ok(());
+        };
+        if asked.remove(fid).is_none() {
+            return Ok(());
+        }
+        self.write_state(&st)
     }
 
     pub(crate) fn exempt(&mut self, fid: &str, ts: f64) -> io::Result<()> {

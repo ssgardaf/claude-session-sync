@@ -457,6 +457,11 @@ pub trait System {
     /// Is this process inside the Claude app's sandbox (see the `sandbox` module)? There,
     /// what is written to the user's registry is seen by no process outside the app.
     fn sandboxed(&mut self, localappdata: Option<&Path>) -> bool;
+    /// Whether the desktop app is running, where that is not to be found out the usual way
+    /// (from the process list and the app's log): tests say so here. None otherwise.
+    fn app_running_override(&mut self) -> Option<bool> {
+        None
+    }
 }
 
 pub struct RealSystem;

@@ -140,21 +140,21 @@ fn common_options() {
 
 #[test]
 fn undo_takes_a_local_time() {
-    let Command::Undo { since } = command(&["undo", "--since", "2026-11-11 10:30"]) else {
+    let Command::Undo { since, .. } = command(&["undo", "--since", "2026-11-11 10:30"]) else {
         panic!("not an undo");
     };
     assert_eq!(
         winfs::local_format(since, "%Y-%m-%d %H:%M:%S"),
         "2026-11-11 10:30:00"
     );
-    let Command::Undo { since } = command(&["undo", "--since=2026-11-11 10:30:15"]) else {
+    let Command::Undo { since, .. } = command(&["undo", "--since=2026-11-11 10:30:15"]) else {
         panic!("not an undo");
     };
     assert_eq!(
         winfs::local_format(since, "%Y-%m-%d %H:%M:%S"),
         "2026-11-11 10:30:15"
     );
-    let Command::Undo { since } = command(&["undo", "--since", "2026-11-11"]) else {
+    let Command::Undo { since, .. } = command(&["undo", "--since", "2026-11-11"]) else {
         panic!("not an undo");
     };
     assert_eq!(
@@ -165,6 +165,15 @@ fn undo_takes_a_local_time() {
         .unwrap_err()
         .contains("bad --since"));
     assert!(parse(&["undo"]).unwrap_err().contains("--since"));
+    assert!(matches!(
+        command(&["undo", "--since", "2026-11-11"]),
+        Command::Undo { force: false, .. }
+    ));
+    assert!(matches!(
+        command(&["undo", "--force", "--since", "2026-11-11"]),
+        Command::Undo { force: true, .. }
+    ));
+    assert!(parse(&["sync", "--force"]).is_err());
 }
 
 #[test]
@@ -241,6 +250,7 @@ fn help_names_every_command() {
         "--purge",
         "--all",
         "--no-delete-sync",
+        "--force",
         "settings.json",
         "-n N",
         "--version",

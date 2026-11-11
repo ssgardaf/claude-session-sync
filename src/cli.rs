@@ -67,6 +67,8 @@ OPTIONS
     --quick N        daemon, install: seconds between quick checks for changes
                      (default 10; 0 = full passes only)
     --since WHEN     undo: a local time, \"YYYY-MM-DD HH:MM\"
+    --force          undo: go ahead although the Claude app is running (it may
+                     write its old list back over what undo puts right)
     -n N             log: how many lines to show
     --purge          uninstall: also delete this tool's own files (programs,
                      log, backups, quarantine, replaced versions)
@@ -95,7 +97,7 @@ EXAMPLES
         (resolve --all settles every conflict at once.)
     claude-session-sync undo --since \"2026-01-31 09:00\"
         Take back everything done since then. Uninstall (or pause) first, and
-        close the Claude app completely.
+        close the Claude app completely (while it runs, undo wants --force).
 
 GOOD TO KNOW
     A session copied into the account you are signed in to shows up in the app
@@ -157,8 +159,10 @@ pub enum Command {
     Restore {
         id: String,
     },
+    /// `force`: go ahead although the desktop app is running.
     Undo {
         since: f64,
+        force: bool,
     },
     /// What is None is kept from the previous install.
     Install {
@@ -213,7 +217,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         "sync" | "status" => COMMON.to_vec(),
         "resolve" => [&["--all"][..], &COMMON].concat(),
         "daemon" | "install" => [&["--interval", "--quick"][..], &COMMON].concat(),
-        "undo" => vec!["--since"],
+        "undo" => vec!["--since", "--force"],
         "log" => vec!["-n"],
         "uninstall" => vec!["--purge"],
         "stop" | "pause" | "resume" | "restore" | "__path" => Vec::new(),
@@ -224,7 +228,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         (None, None, None);
     let mut lines = 30i64;
     let mut delete_sync: Option<bool> = None;
-    let (mut verbose, mut purge, mut all) = (false, false, false);
+    let (mut verbose, mut purge, mut all, mut force) = (false, false, false, false);
     let mut since: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.into_iter();
@@ -242,7 +246,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
         }
         if matches!(
             opt.as_str(),
-            "--verbose" | "--delete-sync" | "--no-delete-sync" | "--purge" | "--all"
+            "--verbose" | "--delete-sync" | "--no-delete-sync" | "--purge" | "--all" | "--force"
         ) {
             if inline.is_some() {
                 return Err(format!("'{}' takes no value", opt));
@@ -250,6 +254,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             match opt.as_str() {
                 "--verbose" => verbose = true,
                 "--purge" => purge = true,
+                "--force" => force = true,
                 "--all" => all = true,
                 "--delete-sync" => delete_sync = Some(true),
                 _ => delete_sync = Some(false),
@@ -320,6 +325,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
                 since.ok_or_else(|| String::from("'undo' needs --since \"YYYY-MM-DD HH:MM\""))?;
             Command::Undo {
                 since: winfs::parse_when(&text).map_err(|e| format!("bad --since: {}", e))?,
+                force,
             }
         }
         "install" => Command::Install { interval, quick },
@@ -774,6 +780,8 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
             e.get("kind").and_then(Value::as_str) == Some("quarantine")
                 && t > week_ago
                 && !brought_back(e.get("fid").and_then(Value::as_str).unwrap_or(""), t)
+                // (nor one that `undo` has put back: its file is in quarantine no longer)
+                && e.get("q").and_then(Value::as_str).is_some_and(|q| std::path::Path::new(q).exists())
         })
         .collect();
     if !gone.is_empty() {
@@ -977,9 +985,25 @@ fn execute(
                 });
             };
             let result = match &parsed.command {
-                Command::Undo { since } => {
-                    con.say("Close the Claude app completely (tray icon too) before relying on the result.");
-                    s.undo(*since).map(|_| 0).map_err(io_err)
+                Command::Undo { since, force } => {
+                    // The app keeps its session list in memory and writes it back: with it
+                    // running, what undo puts right may not stay. Not without being told to.
+                    let app = match sys.app_running_override() {
+                        Some(known) => known,
+                        None => s.app_running(),
+                    };
+                    if app && !*force {
+                        con.say("The Claude app is running: it may write its own list back over what undo puts right.");
+                        con.say("Nothing was undone. Close the app completely (tray icon too) and run this again,");
+                        con.say("or add --force to go ahead all the same.");
+                        Ok(1)
+                    } else {
+                        if app {
+                            con.say("The Claude app is running: it may write its own list back over what undo puts right.");
+                            con.say("Going ahead all the same (--force).");
+                        }
+                        s.undo(*since).map(|_| 0).map_err(io_err)
+                    }
                 }
                 Command::Daemon { interval, quick } => {
                     s.watch(

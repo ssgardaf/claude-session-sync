@@ -74,7 +74,7 @@ claude-session-sync status
 ```
 
 ```
-OK  daemon 0.1.1 running | 91 of 102 sessions in every account | 2 conflicts | 0 errors
+OK  daemon 0.1.2 running | 91 of 102 sessions in every account | 2 conflicts | 0 errors
 autostart: installed (scheduled task "Claude Session Sync")
 ...
 ```
@@ -185,6 +185,9 @@ To also take back what it did, quit the Claude app completely and run:
 ```
 claude-session-sync undo --since "2026-01-31 14:00"
 ```
+
+While the Claude app is running, `undo` stops and tells you to close it (the app could
+write its own list back over what undo puts right); `--force` goes ahead anyway.
 
 To go back to the state before you ever ran it: quit the app, empty
 `%APPDATA%\Claude\claude-code-sessions`, and unzip the oldest file in `backups\` there.

@@ -483,6 +483,9 @@ impl crate::install::System for NoSystem {
     fn sandboxed(&mut self, _localappdata: Option<&Path>) -> bool {
         false
     }
+    fn app_running_override(&mut self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 /// Run a command line against a test tree. Its exit code and what it printed.
