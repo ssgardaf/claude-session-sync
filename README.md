@@ -246,7 +246,7 @@ cargo test --release
 cargo build --release
 ```
 
-Rust 1.82 or later. Every dependency is pure Rust, so both the MSVC and the GNU
+Rust 1.88 or later. Every dependency is pure Rust, so both the MSVC and the GNU
 toolchain work. The two programs are in `target\release`: `claude-session-sync.exe` is
 the command-line tool, `claude-session-syncw.exe` is the same program without a console
 window, which the scheduled task runs.

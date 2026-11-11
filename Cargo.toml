@@ -2,7 +2,7 @@
 name = "claude-session-sync"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 description = "Keeps the Claude desktop app's Code-tab session list the same under every account signed in on a Windows PC."
 keywords = ["claude", "sessions", "sync", "windows"]
 categories = ["command-line-utilities"]

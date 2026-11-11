@@ -27,7 +27,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.82
-        run: rustup toolchain install 1.82 --profile minimal
-      - name: Build with Rust 1.82
-        run: cargo +1.82 build --release --locked
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88 --profile minimal
+      - name: Build with Rust 1.88
+        run: cargo +1.88 build --release --locked
