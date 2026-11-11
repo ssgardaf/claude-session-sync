@@ -74,7 +74,7 @@ claude-session-sync status
 ```
 
 ```
-OK  daemon 0.1.0 running | 91 of 102 sessions in every account | 2 conflicts | 0 errors
+OK  daemon 0.1.1 running | 91 of 102 sessions in every account | 2 conflicts | 0 errors
 autostart: installed (scheduled task "Claude Session Sync")
 ...
 ```
@@ -88,7 +88,7 @@ the details: what is pending, anything left alone on purpose, and the last log l
 | See what it did lately | `claude-session-sync log` (`-n 100` for more) |
 | See what it would change, without changing it | `claude-session-sync preview --verbose` |
 | Switch it off for a while, and back on | `claude-session-sync pause` / `resume` |
-| Settle a conflict that `status` reports | `claude-session-sync resolve <id>` |
+| Settle a conflict that `status` reports | `claude-session-sync resolve <id>` (or `resolve --all`) |
 | Get back a session that was removed everywhere | `claude-session-sync restore <id>` |
 | Take back what it did since some time | `claude-session-sync undo --since "2026-01-31 14:00"` |
 | Change its settings | `claude-session-sync install --delete-sync` (run install again with the options you want) |
