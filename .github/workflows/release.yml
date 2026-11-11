@@ -1,0 +1,32 @@
+name: release
+
+# Pushing a tag like v0.1.0 builds the two programs and publishes them as a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        run: cargo test --release --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/claude-session-sync.exe, target/release/claude-session-syncw.exe, README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath claude-session-sync-windows-x64.zip
+          (Get-FileHash claude-session-sync-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  claude-session-sync-windows-x64.zip" |
+            Out-File -Encoding ascii claude-session-sync-windows-x64.zip.sha256
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" claude-session-sync-windows-x64.zip claude-session-sync-windows-x64.zip.sha256 --title "${{ github.ref_name }}" --generate-notes
