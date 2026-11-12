@@ -3,9 +3,14 @@
 //! replaces it when it has been silent for 15 minutes); the programs' folder on the user's
 //! PATH; pausing, resuming and removing all of that.
 //!
+//! That is Windows. On macOS the daemon is a launch agent, on Linux a systemd user unit, and
+//! the program is linked into `~/.local/bin`: see `install_unix.rs`, which has `install`,
+//! `uninstall`, `pause` and `resume` for those systems. What is the same everywhere (the
+//! settings, stopping the daemon, what `--purge` deletes) is here.
+//!
 //! Everything that reaches outside this tool's own folders (Task Scheduler, the registry,
-//! other processes) goes through the `System` trait, so that tests can record what would be
-//! done instead of doing it.
+//! launchd, systemd, other processes) goes through the `System` trait, so that tests can
+//! record what would be done instead of doing it.
 
 use std::fs;
 use std::io;
@@ -15,16 +20,35 @@ use serde_json::Value;
 
 use crate::consts::{OUR_PROCESS_NAMES, VERSION};
 use crate::daemon::acquire_lock;
-use crate::paths::{default_home, Env, Paths};
+#[cfg(windows)]
+use crate::paths::default_home;
+use crate::paths::{Env, Paths};
 use crate::process;
+#[cfg(windows)]
 use crate::sandbox;
 use crate::winfs::{self, Expect};
+#[cfg(windows)]
 use crate::winreg::{self, Text};
+
+#[cfg(unix)]
+#[path = "install_unix.rs"]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
 
 pub const TASK_NAME: &str = "Claude Session Sync";
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
 pub const CONSOLE_EXE: &str = "claude-session-sync.exe";
+/// (On macOS and Linux there is one program: a daemon has no window to hide there.)
+#[cfg(not(windows))]
+pub const CONSOLE_EXE: &str = "claude-session-sync";
 pub const WINDOWLESS_EXE: &str = "claude-session-syncw.exe";
+/// The programs `install` puts in place.
+#[cfg(windows)]
+pub const PROGRAMS: [&str; 2] = [CONSOLE_EXE, WINDOWLESS_EXE];
+#[cfg(not(windows))]
+pub const PROGRAMS: [&str; 1] = [CONSOLE_EXE];
 /// The one-off task through which the PATH is changed from inside the app's sandbox.
 pub const SETUP_TASK_NAME: &str = "Claude Session Sync (setup)";
 /// Where that task leaves its answer: in the folder that holds `bin`.
@@ -187,7 +211,7 @@ pub fn daemon_arguments(s: &Settings) -> String {
     a
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -450,13 +474,25 @@ pub trait System {
     fn is_ours(&mut self, pid: u32, started: Option<f64>) -> bool;
     fn terminate(&mut self, pid: u32) -> bool;
     /// The user's own PATH as the registry has it (not expanded). None if there is none.
+    #[cfg(windows)]
     fn user_path(&mut self) -> io::Result<Option<Text>>;
+    #[cfg(windows)]
     fn set_user_path(&mut self, path: &Text) -> io::Result<()>;
     /// Tell running programs that the environment has changed.
+    #[cfg(windows)]
     fn environment_changed(&mut self);
     /// Is this process inside the Claude app's sandbox (see the `sandbox` module)? There,
     /// what is written to the user's registry is seen by no process outside the app.
+    #[cfg(windows)]
     fn sandboxed(&mut self, localappdata: Option<&Path>) -> bool;
+    /// The number of the user this process runs as (launchd names its services by it).
+    #[cfg(unix)]
+    fn user_id(&mut self) -> u32;
+    /// What starts the daemon on this system: launchd on macOS, systemd elsewhere.
+    #[cfg(unix)]
+    fn manager(&mut self) -> Manager {
+        Manager::native()
+    }
     /// Whether the desktop app is running, where that is not to be found out the usual way
     /// (from the process list and the app's log): tests say so here. None otherwise.
     fn app_running_override(&mut self) -> Option<bool> {
@@ -480,6 +516,7 @@ impl System for RealSystem {
         ))
     }
 
+    #[cfg(windows)]
     fn spawn_detached(&mut self, program: &Path, args: &[String]) -> io::Result<()> {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
@@ -491,6 +528,20 @@ impl System for RealSystem {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(unix)]
+    fn spawn_detached(&mut self, program: &Path, args: &[String]) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0) // not in the terminal's group: Ctrl+C there is not for it
             .spawn()
             .map(|_| ())
     }
@@ -509,20 +560,30 @@ impl System for RealSystem {
         process::terminate(pid)
     }
 
+    #[cfg(windows)]
     fn user_path(&mut self) -> io::Result<Option<Text>> {
         winreg::read_text(&winreg::user_environment(false)?, "Path")
     }
 
+    #[cfg(windows)]
     fn set_user_path(&mut self, path: &Text) -> io::Result<()> {
         winreg::write_text(&winreg::user_environment(true)?, "Path", path)
     }
 
+    #[cfg(windows)]
     fn environment_changed(&mut self) {
         winreg::announce_environment_change();
     }
 
+    #[cfg(windows)]
     fn sandboxed(&mut self, localappdata: Option<&Path>) -> bool {
         sandbox::in_app_sandbox(localappdata)
+    }
+
+    #[cfg(unix)]
+    fn user_id(&mut self) -> u32 {
+        // SAFETY: a call without arguments that cannot fail.
+        unsafe { libc::getuid() }
     }
 }
 
@@ -533,7 +594,8 @@ fn strs(args: &[&str]) -> Vec<String> {
 /// How the daemon is started by itself, if at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Autostart {
-    /// The scheduled task is registered; `paused` if it is disabled.
+    /// The scheduled task is registered (on macOS: the launch agent is loaded; on Linux:
+    /// the user unit is enabled); `paused` if it is disabled.
     Task {
         paused: bool,
     },
@@ -543,11 +605,24 @@ pub enum Autostart {
     /// There is no scheduled task, and this process is inside the app's sandbox, from where
     /// a start-up entry cannot be seen.
     NoTaskSeen,
-    /// Task Scheduler could not be asked.
+    /// The launch agent's or the unit's file is there, but the system has not taken it up.
+    #[cfg(unix)]
+    NotLoaded,
+    /// There is nothing here to start the daemon with (Linux without a systemd user session).
+    #[cfg(unix)]
+    NoManager,
+    /// Task Scheduler (launchd, systemd) could not be asked.
     Unknown,
 }
 
 /// Ask the system how the daemon is started.
+#[cfg(windows)]
+pub fn autostart_for(sys: &mut dyn System, env: &Env) -> Autostart {
+    autostart(sys, env.localappdata.as_deref())
+}
+
+/// Ask the system how the daemon is started.
+#[cfg(windows)]
 pub fn autostart(sys: &mut dyn System, localappdata: Option<&Path>) -> Autostart {
     match sys.run_output("schtasks", &strs(&["/Query", "/TN", TASK_NAME, "/XML"])) {
         Ok((0, xml)) => Autostart::Task {
@@ -564,6 +639,7 @@ pub fn autostart(sys: &mut dyn System, localappdata: Option<&Path>) -> Autostart
 }
 
 /// The ways the programs' folder may be written in a PATH.
+#[cfg(windows)]
 fn spellings(bin: &Path) -> [String; 2] {
     [
         bin.to_string_lossy().into_owned(),
@@ -574,6 +650,7 @@ fn spellings(bin: &Path) -> [String; 2] {
 /// Put the programs' folder on the user's PATH (`add`), or take it off. False if there was
 /// nothing to change. The value keeps its kind, and is read back to make sure it is what was
 /// meant; if it is not, the old value is put back.
+#[cfg(windows)]
 pub fn change_user_path(sys: &mut dyn System, bin: &Path, add: bool) -> Result<bool, String> {
     let spellings = spellings(bin);
     let spellings: Vec<&str> = spellings.iter().map(String::as_str).collect();
@@ -611,6 +688,7 @@ pub fn change_user_path(sys: &mut dyn System, bin: &Path, add: bool) -> Result<b
 /// start the installed program (`exe`) with this command, outside the app. It changes the
 /// PATH and leaves one line saying how that went (`added`, `present`, `removed`, `absent` or
 /// `error: ...`) in the folder that holds `bin`. The exit code: 0 unless there was an error.
+#[cfg(windows)]
 pub fn path_command(sys: &mut dyn System, exe: &Path, add: bool) -> i32 {
     let Some(bin) = exe.parent() else {
         return 1;
@@ -681,11 +759,20 @@ pub struct Setup<'a> {
 
 impl Setup<'_> {
     /// Where the programs are installed: the `bin` folder of this tool's default folder.
+    #[cfg(windows)]
     pub fn bin_dir(&self) -> Option<PathBuf> {
         self.env
             .userprofile
             .as_ref()
             .map(|user| default_home(user).join("bin"))
+    }
+
+    /// Where the program is installed: the `bin` folder of this tool's own folder, wherever
+    /// that is. (On Windows it is always the one in the user's folder, as the PATH names it;
+    /// here the PATH has a link, which can point anywhere.)
+    #[cfg(unix)]
+    pub fn bin_dir(&self) -> Option<PathBuf> {
+        Some(self.paths.home.join("bin"))
     }
 
     fn tell(&mut self, line: &str) {
@@ -698,12 +785,25 @@ impl Setup<'_> {
         stop_daemon(&home, 40, &mut |s| sys.sleep(s))
     }
 
+    /// How to call the program in what is printed: by name once it is on the PATH.
+    fn program(&self, on_path: bool) -> String {
+        match self.bin_dir() {
+            Some(bin) if !on_path => format!("\"{}\"", bin.join(CONSOLE_EXE).display()),
+            _ => String::from("claude-session-sync"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Setup<'_> {
     fn task_exists(&mut self) -> bool {
         self.sys
             .run("schtasks", &strs(&["/Query", "/TN", TASK_NAME]))
             .is_ok_and(|code| code == 0)
     }
+}
 
+impl Setup<'_> {
     /// Wait for a daemon that started after `began` to hold the lock and report itself (and,
     /// if asked, to be of this version). Its pid, as text.
     fn wait_for_daemon(&mut self, began: f64, this_version: bool) -> Option<String> {
@@ -727,7 +827,10 @@ impl Setup<'_> {
         }
         None
     }
+}
 
+#[cfg(windows)]
+impl Setup<'_> {
     /// Put the programs' folder on the user's PATH (`add`), or take it off. False if there
     /// was nothing to change.
     fn set_path(&mut self, bin: &Path, add: bool, sandboxed: bool) -> Result<bool, String> {
@@ -803,14 +906,6 @@ impl Setup<'_> {
             None => Err(String::from(
                 "the one-off task for it did not answer within 15 seconds",
             )),
-        }
-    }
-
-    /// How to call the program in what is printed: by name once it is on the PATH.
-    fn program(&self, on_path: bool) -> String {
-        match self.bin_dir() {
-            Some(bin) if !on_path => format!("\"{}\"", bin.join(CONSOLE_EXE).display()),
-            _ => String::from("claude-session-sync"),
         }
     }
 
@@ -1064,7 +1159,9 @@ impl Setup<'_> {
         self.tell("after you restart the app or sign in again.");
         Ok(())
     }
+}
 
+impl Setup<'_> {
     /// Delete this tool's own files: its state, and the installed programs. Only files and
     /// folders this tool made are deleted, never a folder as a whole that might hold more.
     /// What could not be deleted is returned.
@@ -1088,10 +1185,13 @@ impl Setup<'_> {
             targets.push(dir);
         }
         if let Some(bin) = self.bin_dir() {
-            for name in [CONSOLE_EXE, WINDOWLESS_EXE] {
+            for name in PROGRAMS {
                 let _ = fs::remove_file(bin.join(name));
                 targets.push(bin.join(name));
             }
+            // (what an install that was cut short may have left: see install_unix.rs)
+            #[cfg(unix)]
+            let _ = fs::remove_file(bin.join(format!(".{}.new", CONSOLE_EXE)));
             // the folders themselves go only if nothing else is in them
             let _ = fs::remove_dir(&bin);
             if let Some(base) = bin.parent() {
@@ -1104,7 +1204,10 @@ impl Setup<'_> {
         targets.retain(|t| t.exists());
         targets
     }
+}
 
+#[cfg(windows)]
+impl Setup<'_> {
     /// Remove the autostart and the PATH entry, then stop the daemon. Records already copied,
     /// backups, the quarantine and replaced folders, the journal and the log are left in
     /// place, unless `purge` is given: then this tool's own files are deleted as well.

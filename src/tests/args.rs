@@ -257,11 +257,14 @@ fn help_names_every_command() {
         "--help",
         "EXAMPLES",
         "WHERE THINGS ARE",
+        #[cfg(windows)]
         "%USERPROFILE%\\.claude-session-sync\\",
+        #[cfg(unix)]
+        "~/.claude-session-sync/",
         "sync.log",
-        "backups\\",
-        "quarantine\\",
-        "replaced\\",
+        &format!("backups{}", std::path::MAIN_SEPARATOR),
+        &format!("quarantine{}", std::path::MAIN_SEPARATOR),
+        &format!("replaced{}", std::path::MAIN_SEPARATOR),
         "CLAUDE_SESSION_SYNC_HOME",
         "CLAUDE_SESSION_SYNC_STORE",
         "CLAUDE_CONFIG_DIR",

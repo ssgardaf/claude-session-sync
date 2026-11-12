@@ -1,9 +1,15 @@
 //! The process list: is the desktop app running, and is a given pid one of our daemons.
+//!
+//! What is asked of the system is here for Windows and in `process_unix.rs` for macOS and
+//! Linux, under the same names.
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -11,8 +17,15 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::consts::START_SLACK_SEC;
 
+#[cfg(unix)]
+#[path = "process_unix.rs"]
+mod unix;
+#[cfg(unix)]
+pub use unix::{desktop_app_running, is_desktop_app, processes, start_time, terminate};
+
 /// `(pid, full path or None)` of the running processes whose file name is in `names`
 /// (lower case). None if the list could not be read.
+#[cfg(windows)]
 pub fn processes(names: &[&str]) -> Option<Vec<(u32, Option<String>)>> {
     // SAFETY: plain Win32 calls on handles owned by this function; every buffer passed is
     // valid for the size given.
@@ -58,6 +71,7 @@ pub fn processes(names: &[&str]) -> Option<Vec<(u32, Option<String>)>> {
 
 /// True if the Claude desktop app has a process. When that cannot be told, true (the
 /// cautious answer).
+#[cfg(windows)]
 pub fn desktop_app_running() -> bool {
     let Some(found) = processes(&["claude.exe"]) else {
         return true;
@@ -76,6 +90,7 @@ pub fn desktop_app_running() -> bool {
 }
 
 /// When a process was started, in seconds since 1970. None if that cannot be told.
+#[cfg(windows)]
 pub fn start_time(pid: u32) -> Option<f64> {
     // SAFETY: the handle is checked and closed here; the four out pointers are valid.
     unsafe {
@@ -111,6 +126,7 @@ pub fn is_daemon(pid: u32, names: &[&str], started: Option<f64>) -> bool {
 }
 
 /// End a process. False if it could not be done.
+#[cfg(windows)]
 pub fn terminate(pid: u32) -> bool {
     // SAFETY: the handle is checked and closed here.
     unsafe {
@@ -147,7 +163,7 @@ mod tests {
         ));
         assert!(!is_daemon(
             me,
-            &["python.exe", "pythonw.exe"],
+            &["python.exe", "pythonw.exe", "python", "python3"],
             Some(real_now())
         ));
     }

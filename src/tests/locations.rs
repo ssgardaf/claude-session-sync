@@ -88,7 +88,7 @@ fn overrides_stand_in_for_missing_variables() {
     };
     assert!(Paths::discover(&no_profile)
         .unwrap_err()
-        .contains("USERPROFILE"));
+        .contains(crate::paths::HOME_VAR));
 }
 
 #[test]

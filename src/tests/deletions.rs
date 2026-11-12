@@ -229,7 +229,11 @@ fn deletion_that_was_carried_over_and_undone_is_not_carried_over_again() {
     let b = Base::new();
     b.install(2.0 * HOUR, 0.0);
     b.rec(B, "s1", r().cli("c1").last(HOUR));
-    fs::copy(b.path(B, "s1"), b.path(C, "s1")).unwrap(); // the same version in both
+    // the same version in both (not every system's copy keeps the file's time: it is given
+    // the very same one)
+    fs::copy(b.path(B, "s1"), b.path(C, "s1")).unwrap();
+    let as_in_b = winfs::stat(&b.path(B, "s1")).unwrap().mtime_ns;
+    winfs::set_times(&b.path(C, "s1"), as_in_b, as_in_b).unwrap();
     b.delete(A, "s1", 600.0, Some("c1"));
     let start = now() - 1.0;
     assert_eq!(b.s().run().quarantine, 2);

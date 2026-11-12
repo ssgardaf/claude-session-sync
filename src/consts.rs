@@ -38,7 +38,10 @@ pub const MIN_FREE_BYTES: u64 = 200 * 1024 * 1024;
 
 /// The programs a daemon of this tool runs as. Only these are ever ended to take over from
 /// a daemon that has stalled.
+#[cfg(windows)]
 pub const DAEMON_PROCESS_NAMES: [&str; 2] = ["claude-session-sync.exe", "claude-session-syncw.exe"];
+#[cfg(not(windows))]
+pub const DAEMON_PROCESS_NAMES: [&str; 1] = ["claude-session-sync"];
 
 /// A daemon reports when it started; its process must not be younger than that by more than
 /// this, or it is some other process that was given the same pid later.
@@ -46,9 +49,13 @@ pub const START_SLACK_SEC: f64 = 5.0;
 
 /// Process names a daemon of this tool can have: this program, or its Python predecessor
 /// (which `uninstall` may have to end).
+#[cfg(windows)]
 pub const OUR_PROCESS_NAMES: [&str; 4] = [
     "claude-session-sync.exe",
     "claude-session-syncw.exe",
     "pythonw.exe",
     "python.exe",
 ];
+/// (There was no Python version for macOS or Linux.)
+#[cfg(not(windows))]
+pub const OUR_PROCESS_NAMES: [&str; 1] = ["claude-session-sync"];

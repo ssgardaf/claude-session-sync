@@ -213,8 +213,7 @@ fn test_new_empty_account_folder_counts_as_a_change() {
 fn test_item_that_fails_backs_off_alone_and_the_rest_carry_on() {
     let b = Base::new();
     b.rec(A, "s1", r());
-    fs::create_dir_all(b.path(B, "s1")).unwrap(); // a folder where B's record should be: cannot be mended
-    set_mtime(&b.path(B, "s1"), now() - HOUR);
+    b.block(B, "s1"); // a folder where B's record should be: cannot be mended
     let mut s = b.s();
     let done = s.run();
     assert_eq!((done.failed, done.add), (1, 1));
@@ -303,8 +302,7 @@ fn sync_says_by_its_exit_code_when_it_did_not_go_well() {
     ]);
     b.rec(A, "s1", r());
     b.rec(B, "own", r());
-    fs::create_dir_all(b.path(B, "s1")).unwrap(); // a folder where B's record should be
-    set_mtime(&b.path(B, "s1"), now() - HOUR);
+    b.block(B, "s1"); // a folder where B's record should be
     let (code, said) = command_line(&b, &["sync"]);
     assert_eq!(code, 1);
     assert!(said.contains("failed 1"));

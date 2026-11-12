@@ -1,10 +1,12 @@
 //! claude-session-sync: keep the Claude desktop app's Code-tab session list the same
-//! under every account signed in on this PC.
+//! under every account signed in on this computer (Windows, macOS, Linux).
 //!
 //! The app stores one list per signed-in account and organization:
 //!
 //! ```text
-//! %APPDATA%\Claude\claude-code-sessions\<account>\<org>\local_<id>.json
+//! %APPDATA%\Claude\claude-code-sessions\<account>\<org>\local_<id>.json                   Windows
+//! ~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_<id>.json   macOS
+//! ~/.config/Claude/claude-code-sessions/<account>/<org>/local_<id>.json                       Linux
 //! ```
 //!
 //! Transcripts (`~/.claude/projects/*/<cliSessionId>.jsonl`) are not tied to an account, so
@@ -42,14 +44,18 @@
 //!   the folder it wrote to in the last ten minutes, and failing that every folder.
 //! * Before a version this tool did not write is replaced, it is kept under `replaced\`.
 //!   Every write is journaled first and can be reversed with `undo --since`.
-//! * Reading never makes the app's save fail: files are opened with full sharing, and if
-//!   the app's atomic rename is refused while we hold a file, its own code falls back to
-//!   writing in place. A half-written file is recognised and skipped.
+//! * Reading never makes the app's save fail: on Windows files are opened with full
+//!   sharing, and if the app's atomic rename is refused while we hold a file, its own code
+//!   falls back to writing in place (elsewhere an open file is in nobody's way). A
+//!   half-written file is recognised and skipped.
 //! * `archived-sessions.idx` is left alone (the app treats it as a hint and heals it), as
 //!   are transcripts, credentials and every other file.
 
-#[cfg(not(windows))]
-compile_error!("claude-session-sync only supports Windows");
+//!
+//! What differs between the systems is kept apart: `winfs` / `unixfs` (files), `process` /
+//! `process_unix` (the process list), `install` / `install_unix` (starting by itself: Task
+//! Scheduler, launchd, systemd), `sandbox` and `winreg` (Windows only), `signals` and
+//! `watchdog` (macOS and Linux only). Everything else is the same code everywhere.
 
 pub mod applog;
 pub mod apply;
@@ -63,9 +69,13 @@ pub mod plan;
 pub mod process;
 pub mod pyjson;
 pub mod records;
+#[cfg(windows)]
 pub mod sandbox;
+pub mod signals;
 pub mod sync;
+pub mod watchdog;
 pub mod winfs;
+#[cfg(windows)]
 pub mod winreg;
 
 #[cfg(test)]

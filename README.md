@@ -6,9 +6,11 @@ The desktop app keeps a separate Code-tab session list for every account you sig
 with. Sign out, sign in with another account, and every session you had open is gone
 from the sidebar. The conversations are still on disk; the app just no longer lists
 them. `claude-session-sync` runs in the background and keeps the list the same under
-every account on the PC, so after a switch your sessions are there and you can carry on.
+every account on the computer, so after a switch your sessions are there and you can
+carry on.
 
-- Windows 10/11, one small program, no runtime to install
+- Windows 10/11 and macOS; Linux is experimental (see [Platforms](#platforms))
+- One small program, no runtime to install
 - Never touches transcripts or sign-in data
 - Keeps a copy of anything it replaces (for 14 days), and can undo what it did
 
@@ -18,25 +20,36 @@ every account on the PC, so after a switch your sessions are there and you can c
 
 ## Install
 
-Paste this into PowerShell:
+**Windows.** Paste this into PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/ssgardaf/claude-session-sync/main/install.ps1 | iex
 ```
 
-It downloads the latest release, checks its SHA-256, and installs it. No administrator
-rights, nothing else to install. Then **quit the Claude app completely (tray icon
-included) and open it again**: the app reads its session list only when it starts or
-signs in, so that is when the sessions from your other accounts appear. From then on,
-just switch accounts.
+**macOS and Linux.** Paste this into a terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ssgardaf/claude-session-sync/main/install.sh | sh
+```
+
+Either one downloads the latest release for your system, checks its SHA-256, and
+installs it. No administrator rights (no `sudo`), nothing else to install. Then **quit
+the Claude app completely and open it again** (Windows: the tray icon too; macOS:
+Cmd+Q): the app reads its session list only when it starts or signs in, so that is when
+the sessions from your other accounts appear. From then on, just switch accounts.
 
 What the installer does, so you know:
 
-- puts the two programs in `%USERPROFILE%\.claude-session-sync\bin` and adds that
-  folder to your user `PATH` (new terminals can run `claude-session-sync`);
-- registers a scheduled task named `Claude Session Sync` that starts the daemon when
-  you log on and restarts it if it ever stops;
-- starts the daemon and checks that it really came up.
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| The program | two programs in `%USERPROFILE%\.claude-session-sync\bin` | `~/.claude-session-sync/bin/claude-session-sync` | the same as macOS |
+| On your `PATH` | adds that folder to your user `PATH` | links it as `~/.local/bin/claude-session-sync` | the same as macOS |
+| Starts by itself | a scheduled task named `Claude Session Sync` | a launch agent, `~/Library/LaunchAgents/io.github.ssgardaf.claude-session-sync.plist` | a systemd user unit, `~/.config/systemd/user/claude-session-sync.service` |
+
+In every case the daemon starts when you log in and is started again if it ever stops,
+and the installer checks that it really came up. Nothing else is changed: on macOS and
+Linux no shell profile is edited (if `~/.local/bin` is not on your `PATH`, the installer
+says so and shows the full path to use).
 
 **Update:** run the same line again; your settings are kept.
 **Remove:** `claude-session-sync uninstall`.
@@ -47,23 +60,40 @@ To install with options (see [Configuration](#configuration)), pass them like th
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/ssgardaf/claude-session-sync/main/install.ps1))) --delete-sync
 ```
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/ssgardaf/claude-session-sync/main/install.sh | sh -s -- --delete-sync
+```
+
 If you already used several accounts before installing, `status` may list some
 *conflicts*: sessions whose copies differ in a way the tool will not decide for you.
 That is expected. See [Conflicts](#what-it-will-and-will-not-do); `claude-session-sync
 resolve --all` settles them in one go.
 
-Prefer to look first? Download `claude-session-sync-windows-x64.zip` from the
-[latest release](../../releases/latest), unzip it, and run
-`.\claude-session-sync.exe preview` (writes nothing), then `.\claude-session-sync.exe install`.
+Prefer to look first? Download the file for your system from the
+[latest release](../../releases/latest), unpack it, and run `claude-session-sync preview`
+from that folder (it writes nothing), then `claude-session-sync install`:
+
+| System | File |
+|---|---|
+| Windows (x64) | `claude-session-sync-windows-x64.zip` |
+| macOS (Apple silicon and Intel) | `claude-session-sync-macos-universal.tar.gz` |
+| Linux (x64 / arm64) | `claude-session-sync-linux-x64.tar.gz` / `claude-session-sync-linux-arm64.tar.gz` |
 
 Notes:
 
-- Each account has to have been signed in on this PC at least once, so its folder exists.
-- You can run the installer from a terminal inside the Claude app (or ask Claude Code
-  to do it). The app sandboxes what its terminals write under `AppData` and the
-  registry; the installer notices and works around it.
-- Windows may warn about an unsigned program the first time. Releases are built from
-  this repository by GitHub Actions; you can also [build it yourself](#build-from-source).
+- Each account has to have been signed in on this computer at least once, so its folder
+  exists.
+- Windows: you can run the installer from a terminal inside the Claude app (or ask
+  Claude Code to do it). The app sandboxes what its terminals write under `AppData` and
+  the registry; the installer notices and works around it.
+- Windows may warn about an unsigned program the first time. macOS shows a "Background
+  Items Added" notice for the launch agent, and refuses to run a program that a browser
+  downloaded until you allow it (the install line above uses `curl`, which is not
+  affected). Releases are built from this repository by GitHub Actions; you can also
+  [build it yourself](#build-from-source).
+- Linux without a systemd user session (some containers and minimal setups): the
+  program is installed, but nothing can start the daemon by itself. `install` says so
+  and shows the command to run the daemon yourself.
 
 ## Everyday use
 
@@ -74,7 +104,7 @@ claude-session-sync status
 ```
 
 ```
-OK  daemon 0.1.2 running | 91 of 102 sessions in every account | 2 conflicts | 0 errors
+OK  daemon 0.2.0 running | 91 of 102 sessions in every account | 2 conflicts | 0 errors
 autostart: installed (scheduled task "Claude Session Sync")
 ...
 ```
@@ -96,17 +126,20 @@ the details: what is pending, anything left alone on purpose, and the last log l
 | Remove it | `claude-session-sync uninstall` (add `--purge` to delete its files too) |
 
 `<id>` is the session id that `status` prints, or its first six characters.
-`claude-session-sync --help` has the full list.
+`claude-session-sync --help` has the full list, with the places things are in on your
+system.
 
 ## How it works
 
-The app stores one small record per session:
+The app stores one small record per session, in a folder per account:
 
-```
-%APPDATA%\Claude\claude-code-sessions\<account>\<organization>\local_<id>.json
-```
+| System | The app's session store |
+|---|---|
+| Windows | `%APPDATA%\Claude\claude-code-sessions\<account>\<organization>\local_<id>.json` |
+| macOS | `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>/local_<id>.json` |
+| Linux | `~/.config/Claude/claude-code-sessions/<account>/<organization>/local_<id>.json` |
 
-Transcripts live elsewhere (`~\.claude\projects`) and are not tied to an account. So a
+Transcripts live elsewhere (`~/.claude/projects`) and are not tied to an account. So a
 session "disappears" only because its record sits in another account's folder. The
 daemon copies each record, byte for byte, into the folder of every account, and keeps
 the copies up to date:
@@ -149,8 +182,8 @@ are skipped, since they could not be resumed anyway.
 ## Safety
 
 - Before it replaces a version it did not write itself, it keeps that version
-  (`replaced\`, 14 days, up to 200 MB).
-- Before the first change of each day it zips the whole session store (`backups\`; the
+  (`replaced`, 14 days, up to 200 MB).
+- Before the first change of each day it zips the whole session store (`backups`; the
   first backup ever is kept for good). If the backup cannot be made, nothing is written.
 - Every addition, replacement and removal is written to a journal before it happens.
   (Refreshing a copy the tool placed itself is not: nothing of yours is in it.)
@@ -163,10 +196,13 @@ are skipped, since they could not be resumed anyway.
   in that moment, it is left alone and looked at again later.
 - It does not link folders together. Current app builds refuse to save into a linked
   folder, which silently loses new sessions.
+- Told to stop (by you, by a logout, by the system shutting down), the daemon finishes
+  the change it is making first.
 - It never uses the network.
 
-Its own files are in `%USERPROFILE%\.claude-session-sync`: `sync.log`, `journal.jsonl`,
-`backups\`, `replaced\`, `quarantine\`, and the programs in `bin\`.
+Its own files are in `%USERPROFILE%\.claude-session-sync` (Windows) or
+`~/.claude-session-sync` (macOS, Linux): `sync.log`, `journal.jsonl`, `backups`,
+`replaced`, `quarantine`, and the program in `bin`.
 
 ## Undo and uninstall
 
@@ -174,11 +210,12 @@ Its own files are in `%USERPROFILE%\.claude-session-sync`: `sync.log`, `journal.
 claude-session-sync uninstall
 ```
 
-removes the scheduled task and the `PATH` entry and stops the daemon. The copies it made
-stay where they are (your accounts keep the full list), and so do its backups and log.
-`claude-session-sync uninstall --purge` also deletes the tool's own folder (the programs
-themselves a few seconds later, since a running program cannot delete itself; if
-anything is left, it tells you what).
+removes the autostart (the scheduled task, the launch agent or the systemd unit) and the
+`PATH` entry or link, and stops the daemon. The copies it made stay where they are (your
+accounts keep the full list), and so do its backups and log.
+`claude-session-sync uninstall --purge` also deletes the tool's own folder. (On Windows
+the programs themselves go a few seconds later, since a running program cannot delete
+itself there; if anything is left, it tells you what.)
 
 To also take back what it did, quit the Claude app completely and run:
 
@@ -189,20 +226,63 @@ claude-session-sync undo --since "2026-01-31 14:00"
 While the Claude app is running, `undo` stops and tells you to close it (the app could
 write its own list back over what undo puts right); `--force` goes ahead anyway.
 
-To go back to the state before you ever ran it: quit the app, empty
-`%APPDATA%\Claude\claude-code-sessions`, and unzip the oldest file in `backups\` there.
-Mind that this also takes sessions you started since then off the list (their
-transcripts stay on disk); `undo` is the gentler way.
+To go back to the state before you ever ran it: quit the app, empty the app's session
+store (the folder in the table under [How it works](#how-it-works)), and unzip the
+oldest file in `backups` there. Mind that this also takes sessions you started since
+then off the list (their transcripts stay on disk); `undo` is the gentler way.
+
+## Platforms
+
+| System | State |
+|---|---|
+| Windows 10/11 (x64) | Supported. This is where the tool began and has run longest. |
+| macOS (Apple silicon and Intel, one universal program) | Supported. |
+| Linux (x64, arm64; a static program, systemd for the autostart) | **Experimental: not yet tested against the real app.** |
+
+**Verified on:**
+
+- Windows 11 with the Microsoft Store build of the app (5.1231): in daily use across
+  several accounts.
+- macOS 26 on Apple silicon with app 1.46388: the whole test suite, the daemon under
+  launchd (install, restart after a crash, pause and resume, uninstall), and the real
+  session store and app log are found and read correctly. Not yet watched on a Mac: an
+  account switch in the app itself. The Intel half of the macOS program is built but
+  has not been run on an Intel Mac.
+
+What "experimental" means for Linux: the program builds, its whole test suite passes
+there, and the daemon was run under a systemd user session against a made-up session
+store. It has not been run against the Claude desktop app for Linux (a beta, for
+Debian and Ubuntu). Where that app keeps its session store and its log
+(`~/.config/Claude`, or under `$XDG_CONFIG_HOME`), and what its program is called, are
+taken from how the app is built on the other systems, not from looking at it. If the
+store is somewhere else, `preview` says it was not found and changes nothing; name the
+folder in `CLAUDE_SESSION_SYNC_STORE`. Start with `claude-session-sync preview` and
+please report what you find.
+
+Differences between the systems that you may notice:
+
+- **Coming back after `stop`.** `stop` ends the daemon for the moment; what starts it
+  brings it back: within 5 minutes on Windows and macOS, within a minute on Linux. To
+  keep it off, use `pause`.
+- **A daemon that hangs.** A daemon that has given no sign of life for 15 minutes is
+  replaced on every system (until then `status` shows `STALLED`). On Windows a second
+  copy, started every 5 minutes, ends it and takes its place. launchd and systemd never
+  start a second copy beside a daemon that is still there, so on macOS and Linux the
+  daemon watches itself: when its main loop has not come round for 15 minutes it ends
+  itself (exit code 75, with a line in `sync.log`), and launchd or systemd starts a
+  fresh one. Time the computer spends asleep does not count.
+- **macOS: `pause`** disables the launch agent in launchd's own records, by name.
+  `resume`, `install` and `uninstall` lift that again; launchd keeps listing the name as
+  enabled afterwards, which has no effect.
 
 ## Limits
 
-- **Windows only.** macOS and Linux keep the same kind of records in other places; the
-  code is not written for them yet.
 - **Undocumented internals.** Tested against the Microsoft Store build of the desktop
-  app (5.1231). If an update changes the record format or the log lines this tool reads,
-  it becomes more cautious rather than more daring: records it does not understand are
-  left alone, and if it cannot tell which account is loaded it stops replacing existing
-  records. It may still stop being useful until it is updated.
+  app (5.1231) on Windows; for the other systems see [Platforms](#platforms). If an
+  update changes the record format or the log lines this tool reads, it becomes more
+  cautious rather than more daring: records it does not understand are left alone, and
+  if it cannot tell which account is loaded it stops replacing existing records. It may
+  still stop being useful until it is updated.
 - **A few seconds around a switch.** A session saved in the last second or two before
   you sign out reaches the other accounts 2 to 5 seconds later. Sign in to the next
   account faster than that and you may see that one session in its previous state;
@@ -231,14 +311,21 @@ claude-session-sync install --no-delete-sync
 | `--quick N` | 10 | Seconds between the cheap change checks. `0` = hourly passes only. |
 | `--interval N` | 3600 | Seconds between full passes. |
 
-Environment variables, for unusual setups (set them as user variables so the daemon
-sees them too):
+Environment variables, for unusual setups:
 
 | Variable | Meaning |
 |---|---|
 | `CLAUDE_SESSION_SYNC_HOME` | Where the tool keeps its own files. |
 | `CLAUDE_SESSION_SYNC_STORE` | The app's `claude-code-sessions` folder, if it is not found. |
-| `CLAUDE_CONFIG_DIR` | Honoured as Claude Code does: transcripts are in `<dir>\projects`. |
+| `CLAUDE_CONFIG_DIR` | Honoured as Claude Code does: transcripts are in `<dir>/projects`. |
+
+The daemon has to see them too. On Windows, set them as user variables (Windows
+Settings). On macOS and Linux, set them in the shell you run `install` from: those that
+are set at that moment are written into the launch agent or the systemd unit, and
+`install` says so. Commands you run later (`status`, `undo`, ...) look in the same
+places only if the variables are set then as well. On macOS and Linux the program
+itself is put in the `bin` folder of `CLAUDE_SESSION_SYNC_HOME`; Linux also honours
+`XDG_CONFIG_HOME` when it looks for the app's folder.
 
 ## Build from source
 
@@ -249,13 +336,19 @@ cargo test --release
 cargo build --release
 ```
 
-Rust 1.88 or later. Every dependency is pure Rust, so both the MSVC and the GNU
-toolchain work. The two programs are in `target\release`: `claude-session-sync.exe` is
-the command-line tool, `claude-session-syncw.exe` is the same program without a console
-window, which the scheduled task runs.
+Rust 1.88 or later, on Windows, macOS or Linux. Every dependency is pure Rust (on
+Windows both the MSVC and the GNU toolchain work). The result is in `target/release`:
+
+- Windows: `claude-session-sync.exe` is the command-line tool, and
+  `claude-session-syncw.exe` the same program without a console window, which the
+  scheduled task runs.
+- macOS and Linux: `claude-session-sync` is all there is. (A `claude-session-syncw` is
+  built there as well; it is the same program, and is not installed or released.)
 
 The test suite (more than 200 tests) works in throwaway folders and never writes to your
-real profile. A few tests read the process list and the task list.
+real profile. A few tests read the process list; on Windows a few also read the task
+list. The tests of `install`, `uninstall`, `pause` and `resume` never reach Task
+Scheduler, launchd or systemd: they record what would be run.
 
 ## License
 

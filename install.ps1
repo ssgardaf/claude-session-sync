@@ -15,7 +15,7 @@
     $repo  = 'ssgardaf/claude-session-sync'
     $asset = 'claude-session-sync-windows-x64.zip'
 
-    if ($env:OS -ne 'Windows_NT') { throw 'claude-session-sync supports Windows only.' }
+    if ($env:OS -ne 'Windows_NT') { throw 'This installer is for Windows. On macOS and Linux use install.sh (see the README).' }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $base = "https://github.com/$repo/releases/latest/download"

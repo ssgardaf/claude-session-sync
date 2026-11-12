@@ -3,6 +3,18 @@
 //! This tool's own folder is under `%USERPROFILE%`, not under `%LOCALAPPDATA%`: for a process
 //! started inside the Claude desktop app, Windows redirects what is written under AppData to
 //! a private copy inside the app's package, where the daemon (started outside) never looks.
+//!
+//! On macOS and Linux the same fields are filled from `HOME` (and `XDG_CONFIG_HOME`):
+//!
+//! ```text
+//!              the app's store and log                              this tool's folder
+//! Windows      %APPDATA%\Claude\claude-code-sessions                 %USERPROFILE%\.claude-session-sync
+//!              %LOCALAPPDATA%\Claude\logs\main.log
+//! macOS        ~/Library/Application Support/Claude/claude-code-sessions   ~/.claude-session-sync
+//!              ~/Library/Logs/Claude/main.log
+//! Linux        ${XDG_CONFIG_HOME:-~/.config}/Claude/claude-code-sessions   ~/.claude-session-sync
+//!              ${XDG_CONFIG_HOME:-~/.config}/Claude/logs/main.log
+//! ```
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,9 +25,15 @@ use crate::winfs;
 /// everything else in the library takes an `Env` (or the `Paths` made from it) explicitly.
 #[derive(Clone, Debug, Default)]
 pub struct Env {
+    /// `%APPDATA%`. On macOS `~/Library/Application Support`, on Linux `$XDG_CONFIG_HOME`
+    /// or `~/.config`: the folder that holds the app's `Claude` folder.
     pub appdata: Option<PathBuf>,
+    /// `%LOCALAPPDATA%` (Windows only).
     pub localappdata: Option<PathBuf>,
+    /// `%USERPROFILE%`; elsewhere `$HOME`.
     pub userprofile: Option<PathBuf>,
+    /// `~/Library/Logs` (macOS only): the app's log is in its `Claude` folder.
+    pub library_logs: Option<PathBuf>,
     /// `CLAUDE_CONFIG_DIR`: where Claude Code keeps `projects\` when it is not `~\.claude`.
     pub claude_config_dir: Option<PathBuf>,
     /// `CLAUDE_SESSION_SYNC_HOME`: this tool's state directory.
@@ -24,25 +42,79 @@ pub struct Env {
     pub store_override: Option<PathBuf>,
     pub userdomain: Option<String>,
     pub username: Option<String>,
+    /// `PATH` (looked at on macOS and Linux only, to say whether the program can be called
+    /// by its name).
+    pub path: Option<String>,
 }
 
+/// The variable that names the user's own folder.
+#[cfg(windows)]
+pub const HOME_VAR: &str = "USERPROFILE";
+#[cfg(not(windows))]
+pub const HOME_VAR: &str = "HOME";
+
+/// The variable that leads to the app's store.
+#[cfg(windows)]
+const STORE_VAR: &str = "APPDATA";
+#[cfg(not(windows))]
+const STORE_VAR: &str = "HOME";
+
 impl Env {
+    fn var(name: &str) -> Option<String> {
+        std::env::var_os(name)
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+    }
+
+    #[cfg(windows)]
     pub fn from_process() -> Env {
-        fn var(name: &str) -> Option<String> {
-            std::env::var_os(name)
-                .map(|v| v.to_string_lossy().into_owned())
-                .filter(|v| !v.is_empty())
-        }
+        let var = Env::var;
         Env {
             appdata: var("APPDATA").map(PathBuf::from),
             localappdata: var("LOCALAPPDATA").map(PathBuf::from),
             userprofile: var("USERPROFILE").map(PathBuf::from),
+            library_logs: None,
             claude_config_dir: var("CLAUDE_CONFIG_DIR").map(PathBuf::from),
             home_override: var("CLAUDE_SESSION_SYNC_HOME").map(PathBuf::from),
             store_override: var("CLAUDE_SESSION_SYNC_STORE").map(PathBuf::from),
             userdomain: var("USERDOMAIN"),
             username: var("USERNAME"),
+            path: var("PATH"),
         }
+    }
+
+    #[cfg(not(windows))]
+    pub fn from_process() -> Env {
+        let var = Env::var;
+        let home = var("HOME").map(PathBuf::from);
+        Env {
+            appdata: Env::app_folders(home.as_deref(), var("XDG_CONFIG_HOME").map(PathBuf::from)),
+            localappdata: None,
+            library_logs: match cfg!(target_os = "macos") {
+                true => home.as_ref().map(|h| h.join("Library").join("Logs")),
+                false => None,
+            },
+            userprofile: home,
+            claude_config_dir: var("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+            home_override: var("CLAUDE_SESSION_SYNC_HOME").map(PathBuf::from),
+            store_override: var("CLAUDE_SESSION_SYNC_STORE").map(PathBuf::from),
+            userdomain: None,
+            username: var("USER"),
+            path: var("PATH"),
+        }
+    }
+
+    /// The folder that holds the app's `Claude` folder on macOS and Linux, for a home folder
+    /// and what `XDG_CONFIG_HOME` says (which counts on Linux only, and only if it is a full
+    /// path, as its specification has it).
+    #[cfg(not(windows))]
+    pub fn app_folders(home: Option<&Path>, xdg_config: Option<PathBuf>) -> Option<PathBuf> {
+        if cfg!(target_os = "macos") {
+            return home.map(|h| h.join("Library").join("Application Support"));
+        }
+        xdg_config
+            .filter(|x| x.is_absolute())
+            .or_else(|| home.map(|h| h.join(".config")))
     }
 }
 
@@ -51,8 +123,10 @@ impl Env {
 pub struct LogDirs {
     /// `%LOCALAPPDATA%`
     pub local: Option<PathBuf>,
-    /// `%APPDATA%`
+    /// `%APPDATA%` (Linux: the configuration folder)
     pub roaming: Option<PathBuf>,
+    /// `~/Library/Logs` (macOS)
+    pub library: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,15 +232,19 @@ impl Paths {
         let root = match &env.store_override {
             Some(p) => p.clone(),
             None => choose_store(&store_candidates(env)).ok_or_else(|| {
-                String::from("APPDATA is not set, and CLAUDE_SESSION_SYNC_STORE is not given")
+                format!(
+                    "{} is not set, and CLAUDE_SESSION_SYNC_STORE is not given",
+                    STORE_VAR
+                )
             })?,
         };
         let home = match (&env.home_override, &env.userprofile) {
             (Some(p), _) => p.clone(),
             (None, Some(user)) => default_home(user),
             (None, None) => {
-                return Err(String::from(
-                    "USERPROFILE is not set, and CLAUDE_SESSION_SYNC_HOME is not given",
+                return Err(format!(
+                    "{} is not set, and CLAUDE_SESSION_SYNC_HOME is not given",
+                    HOME_VAR
                 ))
             }
         };
@@ -174,8 +252,9 @@ impl Paths {
             (Some(p), _) => p.join("projects"),
             (None, Some(user)) => user.join(".claude").join("projects"),
             (None, None) => {
-                return Err(String::from(
-                    "USERPROFILE is not set, and CLAUDE_CONFIG_DIR is not given",
+                return Err(format!(
+                    "{} is not set, and CLAUDE_CONFIG_DIR is not given",
+                    HOME_VAR
                 ))
             }
         };
@@ -186,6 +265,7 @@ impl Paths {
             logs: LogDirs {
                 local: env.localappdata.clone(),
                 roaming: env.appdata.clone(),
+                library: env.library_logs.clone(),
             },
         })
     }
@@ -213,6 +293,9 @@ impl LogDirs {
         }
         if let Some(roaming) = &self.roaming {
             out.push(roaming.join("Claude").join("logs").join("main.log"));
+        }
+        if let Some(library) = &self.library {
+            out.push(library.join("Claude").join("main.log"));
         }
         out
     }

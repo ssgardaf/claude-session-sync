@@ -87,12 +87,11 @@ fn test_folder_the_app_loads_between_planning_and_writing_is_left_alone() {
 fn test_failures_of_something_no_longer_wanted_are_forgotten() {
     let b = Base::new();
     b.rec(A, "s1", r());
-    fs::create_dir_all(b.path(B, "s1")).unwrap();
-    set_mtime(&b.path(B, "s1"), now() - HOUR);
+    let in_the_way = b.block(B, "s1");
     let mut s = b.s();
     assert_eq!(s.run().failed, 1);
     assert_eq!(s.retry.len(), 1);
-    fs::remove_dir(b.path(B, "s1")).unwrap();
+    fs::remove_dir(in_the_way).unwrap();
     b.delete(B, "s1", 0.0, None); // B does not want it any more
     s.run();
     assert!(s.retry.is_empty());

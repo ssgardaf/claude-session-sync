@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
 use serde_json::{json, Value};
@@ -193,12 +194,11 @@ fn test_reading_does_not_block_the_app_from_saving_or_deleting() {
         let mut fh = winfs::open_shared(&p).unwrap();
         {
             // the app's fallback when its rename is refused: write in place (it shares read and write only)
-            let mut app = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(0x1 | 0x2)
-                .open(&p)
-                .unwrap();
+            let mut app = fs::OpenOptions::new();
+            app.read(true).write(true);
+            #[cfg(windows)]
+            app.share_mode(0x1 | 0x2);
+            let mut app = app.open(&p).unwrap();
             app.write_all(b"X").unwrap();
         }
         let mut one = [0u8; 1];

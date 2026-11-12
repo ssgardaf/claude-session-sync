@@ -2,14 +2,19 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 use serde_json::{json, Value};
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::apply::Counts;
@@ -117,6 +122,9 @@ impl Sync {
     }
 
     fn beat(&mut self, lp: &mut Loop) {
+        // (macOS, Linux: the daemon's own watchdog goes by the same event as the heartbeat
+        // in status.json, by which the Windows takeover judges)
+        crate::watchdog::beat();
         lp.beat_at = self.now();
         let fields = [
             ("pid", json!(std::process::id())),
@@ -233,6 +241,7 @@ impl Sync {
         sleep: &mut dyn FnMut(f64),
     ) {
         self.stop_requested(); // a flag left by an earlier stop must not end this run
+        crate::watchdog::beat(); // the loop has begun: from here on it is expected to come round
         let mut lp = Loop {
             interval,
             quick,
@@ -302,6 +311,12 @@ impl Sync {
             let end = self.now() + wait;
             // bounded, so a clock set back cannot stretch the wait
             for _ in 0..((wait / tick.min(wait)) as usize + 2) {
+                if let Some(signal) = crate::signals::received() {
+                    // told to end by the system (a stop, a logout) or from the keyboard
+                    self.report(&mut lp, true);
+                    self.log(&format!("daemon stopped by {}", signal));
+                    return;
+                }
                 if self.stop_requested() {
                     self.report(&mut lp, true);
                     self.log("daemon stopped on request");
@@ -335,21 +350,17 @@ pub struct Lock {
     file: File,
 }
 
+#[cfg(windows)]
 fn first_byte() -> OVERLAPPED {
     // SAFETY: OVERLAPPED is plain data; all zeroes means offset 0 and no event.
     unsafe { std::mem::zeroed() }
 }
 
-/// Take the single-instance lock: the first byte of `daemon.lock`, exclusively, without
-/// waiting (the same byte the Python version locks, so the two exclude each other).
-/// None if another process (or handle) holds it.
-pub fn acquire_lock(home: &Path) -> io::Result<Option<Lock>> {
-    fs::create_dir_all(home)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(home.join("daemon.lock"))?;
+/// Lock the open file exclusively, without waiting. False if another process (or another
+/// handle in this one) holds the lock. On Windows it is the first byte that is locked (the
+/// same byte the Python version locks, so the two exclude each other).
+#[cfg(windows)]
+fn try_lock(file: &File) -> bool {
     let mut range = first_byte();
     // SAFETY: the handle is open for the duration of the call; `range` is a valid OVERLAPPED.
     let ok = unsafe {
@@ -362,7 +373,45 @@ pub fn acquire_lock(home: &Path) -> io::Result<Option<Lock>> {
             &mut range,
         )
     };
-    if ok == 0 {
+    ok != 0
+}
+
+#[cfg(windows)]
+fn unlock(file: &File) {
+    let mut range = first_byte();
+    // SAFETY: as in `try_lock`.
+    unsafe {
+        UnlockFileEx(file.as_raw_handle() as _, 0, 1, 0, &mut range);
+    }
+}
+
+/// On macOS and Linux the lock is on the open file as a whole (`flock`): like the lock on
+/// Windows it is held against other processes and against other handles in this one, is not
+/// passed on to programs this one starts, and ends with the process however that ends.
+#[cfg(unix)]
+fn try_lock(file: &File) -> bool {
+    // SAFETY: the descriptor is open for the duration of the call.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(unix)]
+fn unlock(file: &File) {
+    // SAFETY: as in `try_lock`.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+/// Take the single-instance lock on `daemon.lock`, exclusively, without waiting.
+/// None if another process (or handle) holds it.
+pub fn acquire_lock(home: &Path) -> io::Result<Option<Lock>> {
+    fs::create_dir_all(home)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(home.join("daemon.lock"))?;
+    if !try_lock(&file) {
         return Ok(None);
     }
     Ok(Some(Lock { file }))
@@ -374,36 +423,16 @@ pub fn is_running(home: &Path) -> bool {
     let Ok(file) = OpenOptions::new().read(true).open(home.join("daemon.lock")) else {
         return false;
     };
-    let mut range = first_byte();
-    // SAFETY: as in `acquire_lock`.
-    let got = unsafe {
-        LockFileEx(
-            file.as_raw_handle() as _,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            1,
-            0,
-            &mut range,
-        )
-    };
-    if got == 0 {
+    if !try_lock(&file) {
         return true;
     }
-    let mut range = first_byte();
-    // SAFETY: as above; the lock just taken is given back.
-    unsafe {
-        UnlockFileEx(file.as_raw_handle() as _, 0, 1, 0, &mut range);
-    }
+    unlock(&file); // the lock just taken is given back
     false
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let mut range = first_byte();
-        // SAFETY: as in `acquire_lock`.
-        unsafe {
-            UnlockFileEx(self.file.as_raw_handle() as _, 0, 1, 0, &mut range);
-        }
+        unlock(&self.file);
     }
 }
 

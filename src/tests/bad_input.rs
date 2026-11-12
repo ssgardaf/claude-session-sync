@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+#[cfg(windows)]
 use std::process::Command;
 
 use serde_json::json;
@@ -259,22 +260,31 @@ fn test_linked_account_folder_is_skipped() {
     let target = b.tmp.join("elsewhere");
     fs::create_dir_all(&target).unwrap();
     let link = b.root.join(uid(0xf0));
-    let made = Command::new("cmd")
-        .arg("/c")
-        .arg("mklink")
-        .arg("/J")
-        .arg(&link)
-        .arg(&target)
-        .output();
-    if !made.is_ok_and(|o| o.status.success()) {
-        eprintln!("skipped: cannot create a junction here");
-        return;
+    #[cfg(windows)]
+    {
+        let made = Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&target)
+            .output();
+        if !made.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: cannot create a junction here");
+            return;
+        }
     }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
     fs::create_dir_all(target.join(uid(0xf1))).unwrap();
     b.rec(A, "s1", r());
     let mut s = b.s();
     assert_eq!(names(&s), vec![la(), lb(), lc()]);
     s.run();
     assert!(listdir(&target.join(uid(0xf1))).is_empty());
-    let _ = fs::remove_dir(&link); // the link itself, not what it points at
+    // the link itself, not what it points at
+    #[cfg(windows)]
+    let _ = fs::remove_dir(&link);
+    #[cfg(unix)]
+    let _ = fs::remove_file(&link);
 }

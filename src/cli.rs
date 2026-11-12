@@ -11,17 +11,24 @@ use serde_json::Value;
 use crate::consts::VERSION;
 use crate::daemon::{acquire_lock, lock_for_daemon};
 use crate::history::journal_entries;
-use crate::install::{self, Autostart, Given, RealSystem, Setup, System, TASK_NAME};
+#[cfg(windows)]
+use crate::install::TASK_NAME;
+use crate::install::{self, Autostart, Given, RealSystem, Setup, System};
 use crate::paths::{Env, Paths};
 use crate::plan::{Kind, Plan};
 use crate::records::copy_in;
 use crate::sync::{num, short, Sync};
 use crate::winfs;
 
-/// What `--help` prints, after a first line with the version.
-pub const HELP: &str = "\
+/// The help text, which differs by system in a few words and in where things are.
+macro_rules! help_text {
+    ($computer:literal, $login:literal, $back:literal, $places:literal) => {
+        concat!(
+            "\
 Keeps the Claude desktop app's Code-tab session list the same under every
-account you sign in to on this PC.
+account you sign in to on ",
+            $computer,
+            ".
 
 The app keeps a separate session list for each account. This tool copies each
 session's record into every account's folder, so a session started under one
@@ -34,7 +41,9 @@ USAGE
 TO BEGIN WITH
     preview       Show what would be copied where; writes nothing (the default)
     sync          Copy now, once, and exit
-    install       Sync automatically from now on (background daemon at logon)
+    install       Sync automatically from now on (background daemon at ",
+            $login,
+            ")
 
 DAY TO DAY
     status        One-line summary, then what is pending and any conflicts
@@ -49,7 +58,9 @@ WHEN SOMETHING IS WRONG
     undo          Take back what this tool did since a given time (--since)
 
 RARELY NEEDED
-    stop          Ask the daemon to exit (it is back in 5 minutes; see pause)
+    stop          Ask the daemon to exit (it is back ",
+            $back,
+            "; see pause)
     daemon        Run the daemon in this window (install does this for you)
 
     ID is the session id that status prints, or its first 6 or more characters.
@@ -107,6 +118,35 @@ GOOD TO KNOW
     This tool never uses the network. To update it, install the new version
     over the old one.
 
+",
+            $places
+        )
+    };
+}
+
+/// What is said where the desktop app has to be closed for good.
+#[cfg(windows)]
+const CLOSE_THE_APP: &str = "Close the app completely (tray icon too)";
+#[cfg(target_os = "macos")]
+const CLOSE_THE_APP: &str = "Quit the app completely (Cmd+Q)";
+#[cfg(all(unix, not(target_os = "macos")))]
+const CLOSE_THE_APP: &str = "Quit the app completely";
+
+/// What this computer is called in what is printed.
+#[cfg(windows)]
+const THIS_COMPUTER: &str = "this PC";
+#[cfg(target_os = "macos")]
+const THIS_COMPUTER: &str = "this Mac";
+#[cfg(all(unix, not(target_os = "macos")))]
+const THIS_COMPUTER: &str = "this computer";
+
+/// What `--help` prints, after a first line with the version.
+#[cfg(windows)]
+pub const HELP: &str = help_text!(
+    "this PC",
+    "logon",
+    "in 5 minutes",
+    "\
 WHERE THINGS ARE
     %USERPROFILE%\\.claude-session-sync\\     this tool's own files:
         bin\\                                the programs, once installed
@@ -128,7 +168,76 @@ ENVIRONMENT
                                  install is)
     CLAUDE_CONFIG_DIR            Claude Code's folder, if it is not
                                  %USERPROFILE%\\.claude
-";
+"
+);
+
+/// What `--help` prints, after a first line with the version.
+#[cfg(target_os = "macos")]
+pub const HELP: &str = help_text!(
+    "this Mac",
+    "login",
+    "within minutes",
+    "\
+WHERE THINGS ARE
+    ~/.claude-session-sync/               this tool's own files:
+        bin/                              the program, once installed
+        sync.log                          what it did
+        backups/                          the session lists, zipped once a
+                                          day before the first change
+        replaced/                         versions it replaced (14 days)
+        quarantine/                       sessions --delete-sync took out
+        journal.jsonl                     what undo goes by
+        settings.json                     what install was told
+    ~/Library/Application Support/Claude/claude-code-sessions/
+                                          the app's session lists (synced)
+    ~/.claude/projects/                   transcripts (only looked at)
+    ~/Library/LaunchAgents/io.github.ssgardaf.claude-session-sync.plist
+                                          starts the daemon at login
+    ~/.local/bin/claude-session-sync      a link to the program
+
+ENVIRONMENT
+    CLAUDE_SESSION_SYNC_HOME     Keep this tool's own files in this folder
+    CLAUDE_SESSION_SYNC_STORE    The app's claude-code-sessions folder, if it
+                                 is not found by itself
+    CLAUDE_CONFIG_DIR            Claude Code's folder, if it is not ~/.claude
+    Those that are set when install runs are written into the launch agent,
+    so that the daemon looks in the same places.
+"
+);
+
+/// What `--help` prints, after a first line with the version.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const HELP: &str = help_text!(
+    "this computer",
+    "login",
+    "within minutes",
+    "\
+WHERE THINGS ARE
+    ~/.claude-session-sync/               this tool's own files:
+        bin/                              the program, once installed
+        sync.log                          what it did
+        backups/                          the session lists, zipped once a
+                                          day before the first change
+        replaced/                         versions it replaced (14 days)
+        quarantine/                       sessions --delete-sync took out
+        journal.jsonl                     what undo goes by
+        settings.json                     what install was told
+    ~/.config/Claude/claude-code-sessions/
+                                          the app's session lists (synced)
+    ~/.claude/projects/                   transcripts (only looked at)
+    ~/.config/systemd/user/claude-session-sync.service
+                                          starts the daemon at login
+    ~/.local/bin/claude-session-sync      a link to the program
+
+ENVIRONMENT
+    CLAUDE_SESSION_SYNC_HOME     Keep this tool's own files in this folder
+    CLAUDE_SESSION_SYNC_STORE    The app's claude-code-sessions folder, if it
+                                 is not found by itself
+    CLAUDE_CONFIG_DIR            Claude Code's folder, if it is not ~/.claude
+    Those that are set when install runs are written into the systemd unit,
+    so that the daemon looks in the same places. XDG_CONFIG_HOME is honoured.
+"
+);
 
 /// The whole help text.
 pub fn help() -> String {
@@ -627,8 +736,9 @@ pub fn store_notice(env: &Env, paths: &Paths) -> Vec<String> {
     lines.push(String::from(
         "environment variable CLAUDE_SESSION_SYNC_STORE. (If the Code tab of the Claude desktop app",
     ));
-    lines.push(String::from(
-        "has never been used on this PC, there is nothing to sync yet.)",
+    lines.push(format!(
+        "has never been used on {}, there is nothing to sync yet.)",
+        THIS_COMPUTER
     ));
     lines
 }
@@ -650,7 +760,7 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
         Some(Value::Object(m)) => m,
         _ => serde_json::Map::new(),
     };
-    let autostart = install::autostart(sys, env.localappdata.as_deref());
+    let autostart = install::autostart_for(sys, env);
     let paused = autostart == (Autostart::Task { paused: true });
     let version = st
         .get("version")
@@ -703,6 +813,9 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
         count(plan.notes.conflicts.len(), "conflict"),
         count(errors, "error")
     ));
+    #[cfg(unix)]
+    con.say(&install::autostart_line(autostart, sys.manager()));
+    #[cfg(windows)]
     con.say(&match autostart {
         Autostart::Task { paused: false } => format!("autostart: installed (scheduled task \"{}\")", TASK_NAME),
         Autostart::Task { paused: true } => {
@@ -857,12 +970,16 @@ pub fn run_with(args: &[String], env: &Env, con: &Console, sys: &mut dyn System)
             con.say(VERSION);
             return 0;
         }
+        // (the PATH is the registry's business on Windows only)
+        #[cfg(windows)]
         Command::PathSetup { add } => {
             return match std::env::current_exe() {
                 Ok(exe) => install::path_command(sys, &exe, add),
                 Err(_) => 1,
             };
         }
+        #[cfg(not(windows))]
+        Command::PathSetup { .. } => return 1,
         _ => {}
     }
     let paths = match Paths::discover(env) {
@@ -994,7 +1111,10 @@ fn execute(
                     };
                     if app && !*force {
                         con.say("The Claude app is running: it may write its own list back over what undo puts right.");
-                        con.say("Nothing was undone. Close the app completely (tray icon too) and run this again,");
+                        con.say(&format!(
+                            "Nothing was undone. {} and run this again,",
+                            CLOSE_THE_APP
+                        ));
                         con.say("or add --force to go ahead all the same.");
                         Ok(1)
                     } else {
@@ -1059,7 +1179,18 @@ fn execute(
 /// a console window.
 pub fn process_main(windowless: bool) -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "daemon") {
+        // told to end, the daemon finishes what it is doing first (macOS and Linux)
+        crate::signals::watch_for_termination();
+    }
     let env = Env::from_process();
+    #[cfg(unix)]
+    if args.first().is_some_and(|a| a == "daemon") {
+        // a daemon that stops coming round ends itself, and is started afresh (macOS and Linux)
+        if let Ok(paths) = Paths::discover(&env) {
+            crate::watchdog::start(&paths.home, crate::watchdog::Pace::default());
+        }
+    }
     let console = Console {
         windowless,
         ..Console::stdio()

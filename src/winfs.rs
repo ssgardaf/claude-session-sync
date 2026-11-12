@@ -1,29 +1,61 @@
-//! File-system helpers with the exact Windows behaviour the rules depend on.
+//! File-system helpers with the exact behaviour the rules depend on: a file is created
+//! without ever replacing one, replaced in one step, and keeps its times to the last digit
+//! the file system stores.
+//!
+//! The module has its name from the first, Windows-only versions. What differs by system is
+//! here for Windows and in `unixfs.rs` for macOS and Linux, under the same names.
 
-use std::fs::{self, DirEntry, File, OpenOptions};
+use std::fs::{self, DirEntry};
+#[cfg(windows)]
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+#[cfg(windows)]
 use windows_sys::Win32::Globalization::LCMapStringEx;
+#[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, MoveFileExW};
+#[cfg(windows)]
 use windows_sys::Win32::System::Time::{
     FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
     TzSpecificLocalTimeToSystemTime,
 };
 
+#[cfg(unix)]
+#[path = "unixfs.rs"]
+mod unix;
+#[cfg(unix)]
+use unix::{create, from_metadata};
+#[cfg(unix)]
+pub use unix::{
+    disk_free, local_fields, local_to_epoch, norm, open_shared, rename_noreplace, replace,
+    set_times,
+};
+
+#[cfg(windows)]
 const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000; // 1601 -> 1970, in 100 ns steps
+#[cfg(windows)]
 const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // read | write | delete
+#[cfg(windows)]
 const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+#[cfg(windows)]
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+#[cfg(windows)]
 const LCMAP_LOWERCASE: u32 = 0x100;
 
-/// What a file looked like: times in integer nanoseconds since 1970 (in 100 ns steps, exactly
-/// as the file system stores them), and its size.
+/// What a file looked like: times in integer nanoseconds since 1970 (exactly as the file
+/// system stores them: in 100 ns steps on Windows), and its size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stat {
     pub mtime_ns: i64,
@@ -43,12 +75,14 @@ pub fn ns_to_secs(ns: i64) -> f64 {
     ns.div_euclid(1_000_000_000) as f64 + 1e-9 * ns.rem_euclid(1_000_000_000) as f64
 }
 
+#[cfg(windows)]
 fn filetime_to_ns(ft: u64) -> i64 {
     (ft as i64)
         .saturating_sub(FILETIME_UNIX_EPOCH)
         .saturating_mul(100)
 }
 
+#[cfg(windows)]
 fn from_metadata(md: &fs::Metadata) -> Stat {
     Stat {
         mtime_ns: filetime_to_ns(md.last_write_time()),
@@ -92,6 +126,7 @@ pub fn entry_is_dir(entry: &DirEntry) -> bool {
 /// Open for reading with read, write and delete sharing, so nothing the app does to the
 /// file is refused because of us. (Windows still refuses a classic rename onto an open
 /// file; the app handles that itself by writing in place, which write sharing permits.)
+#[cfg(windows)]
 pub fn open_shared(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -106,6 +141,7 @@ pub fn read_shared(path: &Path) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+#[cfg(windows)]
 fn ns_to_system_time(ns: i64) -> SystemTime {
     if ns >= 0 {
         UNIX_EPOCH + Duration::from_nanos(ns as u64)
@@ -115,6 +151,7 @@ fn ns_to_system_time(ns: i64) -> SystemTime {
 }
 
 /// Set a file's access and modification times (nanoseconds since 1970; kept to 100 ns).
+#[cfg(windows)]
 pub fn set_times(path: &Path, atime_ns: i64, mtime_ns: i64) -> io::Result<()> {
     let fh = OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
@@ -129,6 +166,7 @@ pub fn set_times(path: &Path, atime_ns: i64, mtime_ns: i64) -> io::Result<()> {
 
 /// A path for a direct Win32 call: NUL-terminated UTF-16. A path too long for the classic
 /// API is given in its `\\?\` form, as the standard library does for its own calls.
+#[cfg(windows)]
 fn wide(path: &Path) -> Vec<u16> {
     fn text(units: &[u16], prefix: &str) -> bool {
         units
@@ -158,6 +196,7 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 /// Rename that fails when something is already at `dst` (it never replaces).
+#[cfg(windows)]
 pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
     let (s, d) = (wide(src), wide(dst));
     // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the call.
@@ -168,6 +207,7 @@ pub fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 /// Rename that replaces whatever file is at `dst`.
+#[cfg(windows)]
 pub fn replace(src: &Path, dst: &Path) -> io::Result<()> {
     let (s, d) = (wide(src), wide(dst));
     // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the call.
@@ -219,6 +259,12 @@ impl std::fmt::Display for WriteError {
     }
 }
 
+/// A new, empty file for writing (on Windows: whatever was there is emptied).
+#[cfg(windows)]
+fn create(path: &Path) -> io::Result<File> {
+    File::create(path)
+}
+
 fn temp_name(path: &Path) -> PathBuf {
     let base = path
         .file_name()
@@ -238,7 +284,7 @@ pub fn atomic_write(
     let tmp = temp_name(path);
     let result = (|| -> Result<(), WriteError> {
         {
-            let mut fh = File::create(&tmp)?;
+            let mut fh = create(&tmp)?;
             fh.write_all(data)?;
             if fsync {
                 fh.flush()?;
@@ -274,6 +320,7 @@ pub fn atomic_write(
 }
 
 /// Bytes free for this user on the volume that holds `path`.
+#[cfg(windows)]
 pub fn disk_free(path: &Path) -> io::Result<u64> {
     let p = wide(path);
     let mut free: u64 = 0;
@@ -294,6 +341,7 @@ pub fn disk_free(path: &Path) -> io::Result<u64> {
 
 /// Lower-case the way Windows does for file names in the invariant locale (one code unit
 /// in, one out), which is what the manifest keys written by the Python version use.
+#[cfg(windows)]
 fn lower_invariant(s: &str) -> String {
     let src: Vec<u16> = s.encode_utf16().collect();
     if src.is_empty() {
@@ -322,6 +370,7 @@ fn lower_invariant(s: &str) -> String {
 }
 
 /// The key a path has in the manifest: absolute, backslashes, lower case.
+#[cfg(windows)]
 pub fn norm(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     lower_invariant(&abs.to_string_lossy().replace('/', "\\"))
@@ -342,6 +391,7 @@ pub fn real_now() -> f64 {
 /// A calendar time: (year, month, day, hour, minute, second).
 pub type Fields = (i32, u32, u32, u32, u32, u32);
 
+#[cfg(windows)]
 fn blank_systemtime() -> SYSTEMTIME {
     SYSTEMTIME {
         wYear: 0,
@@ -356,6 +406,7 @@ fn blank_systemtime() -> SYSTEMTIME {
 }
 
 /// (year, month, day, hour, minute, second) in local time, for a time in seconds since 1970.
+#[cfg(windows)]
 pub fn local_fields(epoch: f64) -> Option<Fields> {
     if !epoch.is_finite() {
         return None;
@@ -387,8 +438,8 @@ pub fn local_fields(epoch: f64) -> Option<Fields> {
     ))
 }
 
-/// Seconds since 1970 for a local calendar time. None if it is not a time on the calendar.
-pub fn local_to_epoch(f: Fields) -> Option<f64> {
+/// Is this a time on the calendar (of the years 1601 to 9999)?
+fn on_calendar(f: Fields) -> bool {
     let (year, month, day, hour, minute, second) = f;
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let days = match month {
@@ -396,15 +447,21 @@ pub fn local_to_epoch(f: Fields) -> Option<f64> {
         4 | 6 | 9 | 11 => 30,
         2 if leap => 29,
         2 => 28,
-        _ => return None,
+        _ => return false,
     };
-    if !(1601..=9999).contains(&year)
-        || day < 1
-        || day > days
-        || hour > 23
-        || minute > 59
-        || second > 61
-    {
+    (1601..=9999).contains(&year)
+        && day >= 1
+        && day <= days
+        && hour <= 23
+        && minute <= 59
+        && second <= 61
+}
+
+/// Seconds since 1970 for a local calendar time. None if it is not a time on the calendar.
+#[cfg(windows)]
+pub fn local_to_epoch(f: Fields) -> Option<f64> {
+    let (year, month, day, hour, minute, second) = f;
+    if !on_calendar(f) {
         return None;
     }
     let mut local = blank_systemtime();

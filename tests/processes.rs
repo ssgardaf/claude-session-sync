@@ -1,5 +1,6 @@
 //! Tests that need a second real process: the built programs are run against a throwaway
-//! tree, with every location variable pointed into it.
+//! tree, with every location variable pointed into it (on macOS and Linux that includes the
+//! home folder itself, so that nothing of the real user's is looked at or asked about).
 
 use std::cell::RefCell;
 use std::fs;
@@ -14,7 +15,11 @@ use claude_session_sync::winfs;
 use claude_session_sync::{acquire_lock, lock_for_daemon, release_lock, LogDirs, Paths, Sync};
 
 const CONSOLE: &str = env!("CARGO_BIN_EXE_claude-session-sync");
+#[cfg(windows)]
 const WINDOWLESS: &str = env!("CARGO_BIN_EXE_claude-session-syncw");
+/// (Elsewhere there is one program: a daemon has no window to hide there.)
+#[cfg(not(windows))]
+const WINDOWLESS: &str = CONSOLE;
 
 type Leaf = (&'static str, &'static str);
 const A: Leaf = (
@@ -112,6 +117,7 @@ impl Tree {
             logs: LogDirs {
                 local: Some(self.tmp.join("local")),
                 roaming: Some(self.tmp.join("appdata")),
+                library: None,
             },
         }
     }
@@ -123,6 +129,8 @@ impl Tree {
             .env("APPDATA", self.tmp.join("appdata"))
             .env("LOCALAPPDATA", self.tmp.join("local"))
             .env("USERPROFILE", self.tmp.join("user"))
+            .env("HOME", self.tmp.join("user"))
+            .env("XDG_CONFIG_HOME", self.tmp.join("appdata"))
             .env("CLAUDE_SESSION_SYNC_HOME", &self.home)
             .env("CLAUDE_SESSION_SYNC_STORE", &self.root)
             .env_remove("CLAUDE_CONFIG_DIR")
@@ -199,12 +207,7 @@ impl Tree {
     /// A daemon of ours that has come up and holds the lock.
     fn daemon(&self, exe: &str, args: &[&str]) -> Guard {
         let mut c = self.program(exe, args);
-        let daemon = Guard(
-            c.stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        let daemon = Guard(start(c.stdout(Stdio::null()).stderr(Stdio::null())));
         let pid = daemon.0.id() as u64;
         wait_for("the daemon to come up", Duration::from_secs(30), || {
             self.status_pid() == Some(pid)
@@ -212,6 +215,40 @@ impl Tree {
         assert!(acquire_lock(&self.home).unwrap().is_none());
         daemon
     }
+}
+
+/// Start a program. A program file that was copied a moment ago can be "busy" for an instant
+/// on Linux and macOS: a process another test is starting at that moment still has the copy
+/// open, as this process had while it wrote it, until it has become its own program. Tried
+/// again, it starts.
+fn start(c: &mut Command) -> Child {
+    for _ in 0..100 {
+        match c.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            started => return started.unwrap(),
+        }
+    }
+    panic!("the program stayed busy");
+}
+
+/// Something that is alive for a while, does nothing, and is not one of ours.
+fn bystander() -> Command {
+    #[cfg(windows)]
+    let mut c = {
+        let mut c = Command::new("cmd");
+        c.args(["/c", "pause"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut c = {
+        let mut c = Command::new("sleep");
+        c.arg("300");
+        c
+    };
+    c.stdin(Stdio::piped()).stdout(Stdio::null());
+    c
 }
 
 fn file_names(dir: &Path) -> Vec<String> {
@@ -269,14 +306,7 @@ mod daemon {
         let pid = other.0.id();
         let started = t.status_started(); // what the daemon itself reported
                                           // something that is alive but not one of ours
-        let mut bystander = Guard(
-            Command::new("cmd")
-                .args(["/c", "pause"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        let mut bystander = Guard(bystander().spawn().unwrap());
         let bystander_pid = bystander.0.id();
         let mut left_alone = |why: &str| {
             assert!(
@@ -422,5 +452,179 @@ mod daemon {
         assert!(fs::read_to_string(t.home.join("sync.log"))
             .unwrap()
             .contains("daemon stopped on request"));
+    }
+
+    /// Told to end by the system (launchd and systemd send SIGTERM; Ctrl+C and a closing
+    /// terminal send the other two), the daemon finishes what it is doing, says so in its
+    /// log, lets go of the lock and leaves with success.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_told_to_end_by_a_signal_leaves_cleanly() {
+        for (signal, name) in [
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGHUP, "SIGHUP"),
+        ] {
+            let t = Tree::new();
+            t.rec(A, "first");
+            t.rec(B, "own");
+            let mut daemon = t.daemon(CONSOLE, &["daemon", "--interval", "60", "--quick", "1"]);
+            wait_for("the first pass", Duration::from_secs(20), || {
+                t.path(A, "own").exists() && t.path(B, "first").exists()
+            });
+            // SAFETY: the pid is that of the child just started.
+            assert_eq!(
+                unsafe { libc::kill(daemon.0.id() as libc::pid_t, signal) },
+                0
+            );
+            assert_eq!(daemon.exited(Duration::from_secs(10)), Some(0), "{}", name);
+            assert!(acquire_lock(&t.home).unwrap().is_some());
+            let log = fs::read_to_string(t.home.join("sync.log")).unwrap();
+            assert!(
+                log.trim_end()
+                    .ends_with(&format!("daemon stopped by {}", name)),
+                "{}",
+                log
+            );
+            // nothing half-done is left in the store: the records, whole, and no temp file
+            for leaf in [A, B] {
+                assert_eq!(
+                    file_names(&t.root.join(leaf.0).join(leaf.1)),
+                    vec!["local_first.json", "local_own.json"]
+                );
+            }
+            assert_eq!(
+                fs::read(t.path(B, "first")).unwrap(),
+                fs::read(t.path(A, "first")).unwrap()
+            );
+            // and it starts again as if nothing had been
+            let mut again = t.daemon(CONSOLE, &["daemon", "--interval", "60", "--quick", "1"]);
+            let (code, out) = t.run(CONSOLE, &["stop"]);
+            assert_eq!((code, out.trim()), (0, "stopped"));
+            assert_eq!(again.exited(Duration::from_secs(10)), Some(0));
+        }
+    }
+
+    /// Stands in for a daemon whose main loop gets stuck: this test program itself, started a
+    /// second time by the test below with the name of a throwaway folder in a variable. It
+    /// takes the lock, starts the watchdog with a limit of seconds instead of minutes, and
+    /// runs the daemon's loop; after six heartbeats, which take longer than that limit, the
+    /// loop is held where it reports the seventh. (Run as a test of its own, without the
+    /// variable, it does nothing.)
+    #[cfg(unix)]
+    #[test]
+    fn stand_in_for_a_daemon_that_gets_stuck() {
+        use claude_session_sync::watchdog::{self, Pace};
+        let Some(tmp) = std::env::var_os("CSS_TEST_STUCK_DAEMON_TREE").map(PathBuf::from) else {
+            return;
+        };
+        let t = std::mem::ManuallyDrop::new(Tree {
+            root: tmp
+                .join("appdata")
+                .join("Claude")
+                .join("claude-code-sessions"),
+            home: tmp.join("state"),
+            tmp,
+        });
+        let _lock = acquire_lock(&t.home).unwrap().unwrap();
+        watchdog::start(
+            &t.home,
+            Pace {
+                limit: 5.0,
+                check_every: 0.25,
+                second_look: 0.5,
+            },
+        );
+        let mut s = Sync::new(t.paths());
+        s.out = Box::new(|_| {});
+        let mut beats = 0;
+        s.hooks.on_status = Some(Box::new(move || {
+            beats += 1;
+            if beats > 6 {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600)); // stuck for good
+                }
+            }
+        }));
+        s.watch(60.0, 1.0, 1.0, None, &mut |seconds| {
+            std::thread::sleep(Duration::from_secs_f64(seconds))
+        });
+        unreachable!("the loop only ends on request");
+    }
+
+    /// A daemon whose main loop no longer comes round ends itself, with an exit code that
+    /// makes launchd and systemd start a fresh one; while it does come round it is left
+    /// alone, also for longer than the limit; and nothing is in the fresh daemon's way.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_that_is_stuck_ends_itself_so_that_a_fresh_one_is_started() {
+        use claude_session_sync::watchdog::STALL_EXIT_CODE;
+        let t = Tree::new();
+        t.rec(A, "first");
+        t.rec(B, "own");
+        fs::create_dir_all(&t.home).unwrap();
+        let began = Instant::now();
+        let mut stuck = Guard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::stand_in_for_a_daemon_that_gets_stuck",
+                    "--test-threads=1",
+                ])
+                .env("CSS_TEST_STUCK_DAEMON_TREE", &t.tmp)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let code = stuck.exited(Duration::from_secs(60));
+        let took = began.elapsed().as_secs_f64();
+        assert_eq!(code, Some(STALL_EXIT_CODE), "after {} s", took);
+        // six heartbeats a second apart, all within the limit, and then the limit itself
+        assert!(
+            took > 5.0 + 4.0,
+            "ended after {} s: while it was still coming round?",
+            took
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(t.home.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status["pid"].as_u64(), Some(stuck.0.id() as u64)); // it had come up, and reported
+        assert!(t.path(B, "first").exists()); // ...and done its work
+        let log = fs::read_to_string(t.home.join("sync.log")).unwrap();
+        let last = log.trim_end().lines().last().unwrap();
+        assert!(
+            last.contains("the daemon has not come round for ")
+                && last.ends_with("so that a fresh one is started"),
+            "{}",
+            log
+        );
+        // the lock went with the process: a fresh daemon starts, works and stops as ever
+        assert!(acquire_lock(&t.home).unwrap().is_some());
+        t.rec(A, "later");
+        let mut fresh = t.daemon(CONSOLE, &["daemon", "--interval", "60", "--quick", "1"]);
+        wait_for("the fresh daemon's pass", Duration::from_secs(20), || {
+            t.path(B, "later").exists()
+        });
+        let (code, out) = t.run(CONSOLE, &["stop"]);
+        assert_eq!((code, out.trim()), (0, "stopped"));
+        assert_eq!(fresh.exited(Duration::from_secs(10)), Some(0));
+    }
+
+    /// The home folder the tests give the programs is not the real one: what `status` says
+    /// of the autostart is about the throwaway tree, where nothing is installed.
+    #[cfg(unix)]
+    #[test]
+    fn status_does_not_look_at_the_real_users_autostart() {
+        let t = Tree::new();
+        t.rec(A, "s1");
+        let (code, out) = t.run(CONSOLE, &["status"]);
+        assert_eq!(code, 1, "{}", out);
+        assert_eq!(
+            out.lines().nth(1),
+            Some("autostart: not installed (to install: claude-session-sync install)"),
+            "{}",
+            out
+        );
     }
 }

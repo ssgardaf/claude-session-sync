@@ -8,8 +8,16 @@ use crate::sync::Sync;
 use crate::winfs::{atomic_write, rename_noreplace, Expect, WriteError};
 
 /// The manifest key the Python version wrote for a path: absolute, lower case.
+#[cfg(windows)]
 fn python_key(path: &Path) -> String {
     path.to_string_lossy().to_lowercase()
+}
+
+/// (There was no Python version for macOS or Linux: what is checked there is that a
+/// manifest in its older forms is understood. The key is the path as it is spelled.)
+#[cfg(unix)]
+fn python_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 /// `sha256(repr((archived, title)))[:16]` is what Python stored; any 16 hex digits stand in for it.
@@ -37,8 +45,8 @@ fn create_never_replaces_an_existing_file() {
         atomic_write(&p, b"ours", None, true, Expect::Absent),
         Err(WriteError::Changed)
     ));
+    assert_eq!(winfs::stat(&p).unwrap(), before); // (looked at before it is read: reading may count as access)
     assert_eq!(fs::read(&p).unwrap(), b"the app's file"); // (std::fs::rename would have replaced it)
-    assert_eq!(winfs::stat(&p).unwrap(), before);
     assert_eq!(listdir(&b.dir(B)), vec!["local_x.json"]); // and no temp file is left
                                                           // the same holds for the rename itself, and for a folder in the way
     let other = b.dir(B).join("other");
@@ -64,14 +72,15 @@ fn create_never_replaces_an_existing_file() {
         Expect::Absent,
     )
     .unwrap();
-    assert_eq!(fs::read(&fresh).unwrap(), b"ours");
     let st = winfs::stat(&fresh).unwrap();
+    assert_eq!(fs::read(&fresh).unwrap(), b"ours");
     assert_eq!(
         (st.atime_ns, st.mtime_ns),
         (1_700_000_000_123_456_700, 1_700_000_001_987_654_300)
     ); // kept to 100 ns
 }
 
+/// The classic limit is Windows' 260 characters; elsewhere this is a path like any other.
 #[test]
 fn paths_longer_than_the_classic_limit_work() {
     let b = Base::new();
@@ -101,9 +110,10 @@ fn paths_longer_than_the_classic_limit_work() {
     winfs::move_file(&p, &moved).unwrap();
     assert!(!p.exists() && moved.exists());
     assert_eq!(listdir(&dir), vec!["moved.json"]);
-    assert!(winfs::norm(&moved).ends_with("\\moved.json"));
+    assert!(winfs::norm(&moved).ends_with(&format!("{}moved.json", std::path::MAIN_SEPARATOR)));
 }
 
+#[cfg(windows)]
 #[test]
 fn manifest_keys_are_what_python_wrote() {
     let b = Base::new();

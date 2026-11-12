@@ -1,6 +1,7 @@
 name: release
 
-# Pushing a tag like v0.1.0 builds the two programs and publishes them as a release.
+# Pushing a tag like v0.2.0 builds the programs for Windows, macOS and Linux and publishes
+# them as a release. Nothing is published unless every one of them was built and tested.
 on:
   push:
     tags: ["v*"]
@@ -9,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +31,105 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath claude-session-sync-windows-x64.zip
           (Get-FileHash claude-session-sync-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  claude-session-sync-windows-x64.zip" |
             Out-File -Encoding ascii claude-session-sync-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            claude-session-sync-windows-x64.zip
+            claude-session-sync-windows-x64.zip.sha256
+          if-no-files-found: error
+
+  # One program for both kinds of Mac (Apple silicon and Intel).
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the version in Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "v$version" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} does not match Cargo.toml version $version"; exit 1; }
+      - name: Test
+        run: cargo test --release --locked
+      - name: Build
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          mkdir dist
+          lipo -create -output dist/claude-session-sync \
+            target/aarch64-apple-darwin/release/claude-session-sync \
+            target/x86_64-apple-darwin/release/claude-session-sync
+          # (signed ad hoc, as the linker signs each half: Apple silicon runs nothing unsigned)
+          codesign --force --sign - dist/claude-session-sync
+          lipo -archs dist/claude-session-sync
+          dist/claude-session-sync --version
+          cp README.md LICENSE dist/
+          COPYFILE_DISABLE=1 tar -czf claude-session-sync-macos-universal.tar.gz -C dist claude-session-sync README.md LICENSE
+          shasum -a 256 claude-session-sync-macos-universal.tar.gz > claude-session-sync-macos-universal.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            claude-session-sync-macos-universal.tar.gz
+            claude-session-sync-macos-universal.tar.gz.sha256
+          if-no-files-found: error
+
+  # Static programs (musl), so that the C library of the system they run on does not matter.
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: claude-session-sync-linux-x64.tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: claude-session-sync-linux-arm64.tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust, where the runner comes without it
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Tag matches the version in Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "v$version" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} does not match Cargo.toml version $version"; exit 1; }
+      - name: Test
+        run: cargo test --release --locked
+      - name: Build
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/claude-session-sync README.md LICENSE dist/
+          dist/claude-session-sync --version
+          tar -czf ${{ matrix.asset }} -C dist claude-session-sync README.md LICENSE
+          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
       - name: Publish
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" claude-session-sync-windows-x64.zip claude-session-sync-windows-x64.zip.sha256 --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" assets/* --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes

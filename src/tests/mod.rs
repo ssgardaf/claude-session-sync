@@ -3,7 +3,8 @@
 //!
 //! The modules `adds` ... `daemon` are the behaviour contract carried over from the Python
 //! version's test_sync.py, test for test and under the same names. The rest covers what is
-//! new here.
+//! new here. They run on every system; what is specific to one (how the daemon is set to
+//! start by itself) is in `setup` for Windows and in `setup_unix` for macOS and Linux.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -22,6 +23,7 @@ use crate::winfs;
 mod adds;
 mod args;
 mod bad_input;
+mod commands;
 mod compat;
 mod daemon;
 mod deletions;
@@ -31,7 +33,10 @@ mod locations;
 mod newest;
 mod pace;
 mod safety;
+#[cfg(windows)]
 mod setup;
+#[cfg(unix)]
+mod setup_unix;
 mod the_apps_log;
 mod while_the_app_runs;
 
@@ -243,6 +248,24 @@ impl Base {
         Base(Rc::new(tree))
     }
 
+    /// Put something in the way of this tool writing one session's record in one folder, so
+    /// that this item fails and nothing else does. What is in the way is returned: a folder,
+    /// which can be removed again.
+    ///
+    /// On Windows it is a folder where the record should be. Elsewhere such a folder is a
+    /// file this tool cannot read, which it leaves alone without trying; there the folder is
+    /// where the record is first written, under its temporary name.
+    pub fn block(&self, leaf: Leaf, fid: &str) -> PathBuf {
+        #[cfg(windows)]
+        let in_the_way = self.path(leaf, fid);
+        #[cfg(unix)]
+        let in_the_way = self.dir(leaf).join(format!(".sync-local_{}.json.tmp", fid));
+        fs::create_dir_all(&in_the_way).unwrap();
+        #[cfg(windows)]
+        set_mtime(&in_the_way, now() - HOUR);
+        in_the_way
+    }
+
     /// The environment that leads to this tree by the defaults.
     pub fn env(&self) -> Env {
         Env {
@@ -259,6 +282,7 @@ impl Base {
         LogDirs {
             local: Some(self.tmp.join("local")),
             roaming: Some(self.tmp.join("appdata")),
+            library: None,
         }
     }
 
@@ -473,15 +497,23 @@ impl crate::install::System for NoSystem {
     fn terminate(&mut self, _pid: u32) -> bool {
         false
     }
+    #[cfg(windows)]
     fn user_path(&mut self) -> std::io::Result<Option<crate::winreg::Text>> {
         Ok(None)
     }
+    #[cfg(windows)]
     fn set_user_path(&mut self, _path: &crate::winreg::Text) -> std::io::Result<()> {
         Err(std::io::Error::other("not in a test"))
     }
+    #[cfg(windows)]
     fn environment_changed(&mut self) {}
+    #[cfg(windows)]
     fn sandboxed(&mut self, _localappdata: Option<&Path>) -> bool {
         false
+    }
+    #[cfg(unix)]
+    fn user_id(&mut self) -> u32 {
+        501
     }
     fn app_running_override(&mut self) -> Option<bool> {
         Some(false)
