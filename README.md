@@ -276,11 +276,13 @@ running. It counts as running if one of your own processes is the app's program
 (Windows: `claude.exe` from the app's install folder; macOS: a program called `Claude`
 in the `Contents/MacOS` of any application bundle, so a renamed or second copy counts
 too; Linux: `claude-desktop` or `claude` with the app's bundle beside it, or any
-Electron program whose command line names an `app.asar` with "claude" in its path), or,
-on macOS and Linux, if the lock the app's engine keeps in its data folder
-(`SingletonLock`) names a process that is there, or if the app's log was written
-moments ago (on Linux, where the rest is a guess: in the last 10 minutes). Another
-user's app does not count: it has its own store.
+Electron program that is given the app's bundle to run: a path to an `app.asar` with
+"claude" in it), or, on macOS and Linux, if the lock the app's engine keeps in its data
+folder (`SingletonLock`) was taken on this computer by a process of yours that is still
+there, or if the app's log was written moments ago (on Linux, where the rest is a
+guess: in the last 10 minutes). Another user's app does not count: it has its own
+store. A lock left behind by an app that was killed does not count either, once its
+process is gone.
 
 Differences between the systems that you may notice:
 

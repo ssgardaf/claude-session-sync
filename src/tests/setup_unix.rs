@@ -919,8 +919,11 @@ fn install_says_so_when_the_new_daemon_does_not_come_up() {
             Manager::Systemd => {
                 assert!(why.contains("systemctl --user status claude-session-sync"));
                 assert!(!why.contains("sync.log")); // (there is none to point to)
-                assert!(why.contains("taken out again"));
+                assert!(why.contains("The unit was removed again"));
+                assert!(why.contains("not installed to start by itself now"));
                 assert!(!service(&b, manager).exists());
+                // ...and `status` says the same
+                assert_eq!(autostart(&mut sys, &b.env()), Autostart::NotInstalled);
                 assert_eq!((sys.enabled, sys.active), (Some(false), false));
                 assert!(
                     sys.position("systemctl --user enable --now")
@@ -932,12 +935,26 @@ fn install_says_so_when_the_new_daemon_does_not_come_up() {
     // an update that does not come up: the unit that was there is put back, not enabled
     let b = Base::new();
     let mut sys = registered(&b, Manager::Systemd);
-    assert!(act(&b, &mut sys, program(&b), "install").0.is_err());
+    let why = act(&b, &mut sys, program(&b), "install").0.unwrap_err();
     assert_eq!(
         fs::read(service(&b, Manager::Systemd)).unwrap(),
         b"as an install left it"
     );
     assert_eq!((sys.enabled, sys.active), (Some(false), false));
+    // what is said is the state it is left in, and the state `status` reports
+    assert!(why.contains("was put back and is left disabled"), "{}", why);
+    assert!(why.contains("`status` shows it as paused") && why.contains("resume"));
+    assert!(!why.contains("removed again"));
+    assert_eq!(
+        autostart(&mut sys, &b.env()),
+        Autostart::Task { paused: true }
+    );
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(
+        out[1].starts_with("autostart: installed, PAUSED"),
+        "{}",
+        out[1]
+    );
 }
 
 #[test]
@@ -1151,8 +1168,9 @@ fn install_says_so_when_the_manager_does_not_take_the_definition() {
         why
     );
     assert!(why.contains("systemctl --user status claude-session-sync"));
-    assert!(why.contains("taken out again"));
+    assert!(why.contains("The unit was removed again"));
     assert!(!service(&b, Manager::Systemd).exists());
+    assert_eq!(autostart(&mut sys, &b.env()), Autostart::NotInstalled);
     assert_eq!(sys.slept, 0.0); // (no waiting for a daemon that was never started)
 }
 

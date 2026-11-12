@@ -145,6 +145,7 @@ impl Sync {
             ("delete_sync", json!(self.delete_sync)),
             ("days", crate::sync::num_json(self.days)),
             ("last_error", json!(self.last_error)),
+            ("lock_stamp", json!(self.lock_stamp)),
         ];
         self.write_status(&fields);
     }
@@ -189,15 +190,17 @@ impl Sync {
                 if let Some(hook) = self.hooks.after_run.as_mut() {
                     hook();
                 }
-                if lp.done.wrote() == 0 || self.cut_short {
-                    break;
+                if lp.done.wrote() != 0 {
+                    wrote_any = true;
+                    lp.last_change = Some(now as i64);
+                    lp.tally.add += lp.done.add;
+                    lp.tally.update += lp.done.update;
+                    lp.tally.repair += lp.done.repair;
+                    lp.tally.quarantine += lp.done.quarantine;
                 }
-                wrote_any = true;
-                lp.last_change = Some(now as i64);
-                lp.tally.add += lp.done.add;
-                lp.tally.update += lp.done.update;
-                lp.tally.repair += lp.done.repair;
-                lp.tally.quarantine += lp.done.quarantine;
+                if lp.done.wrote() == 0 || self.cut_short {
+                    break; // (what a pass that was cut short did is counted like any other)
+                }
                 pre = None; // still writing after three passes: look again next time
             }
             // an item that was put off (its file had just changed) is simply looked at again
@@ -209,8 +212,14 @@ impl Sync {
             if self.settling == 0 {
                 lp.must_until = 0.0; // nothing is waiting for a save to finish
             }
-            self.report(lp, due_full);
-            if due_full {
+            self.report(lp, due_full || self.cut_short);
+            if self.cut_short {
+                // told to end in the middle of it: not "in sync", and not a full pass made
+                self.log(&format!(
+                    "pass stopped before it was done: {} change(s) left for the next start",
+                    lp.done.deferred
+                ));
+            } else if due_full {
                 let waiting = if lp.done.deferred != 0 {
                     format!(", {} waiting", lp.done.deferred)
                 } else {
@@ -478,10 +487,24 @@ fn holder(home: &Path) -> Option<Holder> {
     })
 }
 
-/// Put on record when the daemon took the lock: the lock file's own time. `status` goes by
-/// it to tell a daemon that has reported since it started from one that has not.
-fn stamp(lock: &Lock) {
-    let _ = lock.file.set_modified(std::time::SystemTime::now());
+/// Mark the lock as taken by this daemon: the lock file is given the present time, and
+/// what the file system kept of it is the mark. The daemon repeats the mark in every report
+/// it makes; `status` takes a report for the lock holder's own only if the two are the same
+/// number. They are compared as marks, never as times: setting the clock, forwards or back,
+/// changes nothing about which report belongs to which daemon.
+fn stamp(lock: &Lock) -> Option<i64> {
+    lock.file.set_modified(std::time::SystemTime::now()).ok()?;
+    lock_mark(&lock.file.metadata().ok()?)
+}
+
+/// The mark on a lock file: its time, as whole nanoseconds.
+pub fn lock_mark(lock: &fs::Metadata) -> Option<i64> {
+    let since = lock
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(since.as_nanos()).ok()
 }
 
 /// The lock for the daemon. A `status` or `stop` may hold it for a moment, so try for a few
@@ -497,7 +520,7 @@ pub fn lock_for_daemon(s: &mut Sync, sleep: &dyn Fn(f64)) -> io::Result<Option<L
     let home = s.p.home.clone();
     for _attempt in 0..12 {
         if let Some(lock) = acquire_lock(&home)? {
-            stamp(&lock);
+            s.lock_stamp = stamp(&lock);
             return Ok(Some(lock));
         }
         if let Some(h) = holder(&home) {
@@ -535,7 +558,7 @@ pub fn lock_for_daemon(s: &mut Sync, sleep: &dyn Fn(f64)) -> io::Result<Option<L
     for _ in 0..20 {
         sleep(0.5);
         if let Some(lock) = acquire_lock(&home)? {
-            stamp(&lock);
+            s.lock_stamp = stamp(&lock);
             return Ok(Some(lock));
         }
     }

@@ -455,6 +455,15 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
+/// What is said of the unit after an install that did not work took it out again: exactly
+/// the state it is left in, which is the state `status` reports afterwards.
+fn unit_left(had_one_before: bool) -> &'static str {
+    match had_one_before {
+        false => "The unit was removed again, so nothing that does not start is left enabled: this tool is not installed to start by itself now.",
+        true => "The unit that was installed before was put back and is left disabled, so nothing that does not start is left enabled: `status` shows it as paused, and `claude-session-sync resume` enables it again.",
+    }
+}
+
 /// A path that can be written into an agent or a unit: text without line breaks.
 fn writable(path: &Path) -> Result<(), String> {
     match path.to_str() {
@@ -777,9 +786,10 @@ impl Setup<'_> {
                         // nothing that does not start is left enabled
                         self.unit_out(&service, before.as_deref());
                         not_started = Some(format!(
-                            "systemd did not take the unit (systemctl --user enable --now exit code {}); it was \
-                             taken out again.\n  Look at:  systemctl --user status {}",
+                            "systemd did not take the unit (systemctl --user enable --now exit code {}).\n  \
+                             {}\n  Look at:  systemctl --user status {}",
                             code,
+                            unit_left(before.is_some()),
                             UNIT_NAME.trim_end_matches(".service")
                         ));
                     }
@@ -867,9 +877,9 @@ impl Setup<'_> {
                 Manager::Systemd => {
                     // (systemd would go on trying once a minute for ever)
                     self.unit_out(&service, before.as_deref());
-                    " The unit was taken out again, so that nothing that does not start is left enabled."
+                    format!("\n  {}", unit_left(before.is_some()))
                 }
-                Manager::Launchd => "",
+                Manager::Launchd => String::new(),
             };
             return Err(format!(
                 "the program was copied and the autostart was set up, but the new daemon did not come up.{}\n  \

@@ -410,6 +410,11 @@ impl Base {
         fs::write(self.home.join("state.json"), st.to_string()).unwrap();
     }
 
+    /// What the daemon last reported (status.json).
+    pub fn status(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.home.join("status.json")).unwrap()).unwrap()
+    }
+
     pub fn state(&self) -> Value {
         serde_json::from_slice(&fs::read(self.home.join("state.json")).unwrap()).unwrap()
     }

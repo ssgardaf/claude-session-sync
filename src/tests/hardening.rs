@@ -44,9 +44,10 @@ fn first_heartbeat_comes_before_the_first_pass() {
     assert!(b.has(B, "s1")); // the pass itself went as ever
 }
 
-/// `status` goes by who holds the lock now. A report that is older than the moment the lock
-/// was taken was left by an earlier daemon: the one that holds the lock has not reported,
-/// which is "starting" for a short while and "stalled" after that, and never "OK".
+/// `status` goes by who holds the lock now. The daemon marks the lock when it takes it and
+/// repeats the mark in every report; a report with another mark was left by an earlier
+/// daemon. The one that holds the lock has then not reported, which is "starting" for a
+/// short while and "stalled" after that, and never "OK".
 #[test]
 fn status_does_not_say_ok_for_a_daemon_that_has_not_reported() {
     let b = Base::new();
@@ -54,6 +55,7 @@ fn status_does_not_say_ok_for_a_daemon_that_has_not_reported() {
     let mut sys = Recorder::new();
     let held = acquire_lock(&b.home).unwrap().unwrap();
     let lock = b.home.join("daemon.lock");
+    let mark = |lock: &Path| crate::daemon::lock_mark(&fs::metadata(lock).unwrap()).unwrap();
     // the lock was just taken, nothing has been reported yet
     let (code, out) = cli(&b, &mut sys, &["status"]);
     assert_eq!(code, 0);
@@ -65,10 +67,11 @@ fn status_does_not_say_ok_for_a_daemon_that_has_not_reported() {
     assert!(out
         .iter()
         .any(|l| l.starts_with("daemon: holds the lock") && l.ends_with("no report from it yet")));
-    // ...nor does a report left by the daemon before it count: not its version, not its errors
+    // ...nor does a report left by the daemon before it count, however fresh it looks: not
+    // its version, not its errors, not its settings
     let old = json!({"pid": 1, "version": "0.0.1", "started": (now() - 9000.0) as i64,
-                     "heartbeat": (now() - 1000.0) as i64, "failed": 3, "last_error": "an old error",
-                     "delete_sync": true, "days": 7});
+                     "heartbeat": now() as i64, "failed": 3, "last_error": "an old error",
+                     "delete_sync": true, "days": 7, "lock_stamp": mark(&lock) - 1});
     fs::write(b.home.join("status.json"), old.to_string()).unwrap();
     let (code, out) = cli(&b, &mut sys, &["status"]);
     assert_eq!(code, 0);
@@ -76,7 +79,7 @@ fn status_does_not_say_ok_for_a_daemon_that_has_not_reported() {
     assert!(out[0].ends_with("| 0 errors"), "{}", out[0]);
     assert!(!out.iter().any(|l| l.contains("0.0.1")));
     assert!(out.iter().any(|l| l.contains("older than 30 days"))); // (not the 7 of that report)
-                                                                   // a minute later it still has not reported: it is stuck, and that is said
+                                                                   // a few minutes later it still has not reported: it is stuck, and that is said
     set_mtime(&lock, now() - 200.0);
     let (code, out) = cli(&b, &mut sys, &["status"]);
     assert_eq!(code, 1);
@@ -85,15 +88,65 @@ fn status_does_not_say_ok_for_a_daemon_that_has_not_reported() {
         "{}",
         out[0]
     );
-    // it reports: all is well
-    let fresh = json!({"pid": 4242, "version": VERSION, "started": (now() - 200.0) as i64,
-                       "heartbeat": now() as i64});
-    fs::write(b.home.join("status.json"), fresh.to_string()).unwrap();
+    // it reports, with the mark that is on the lock: all is well
+    let report = |heartbeat_ago: f64, stamp: i64| {
+        let st = json!({"pid": 4242, "version": VERSION, "started": (now() - 200.0) as i64,
+                        "heartbeat": (now() - heartbeat_ago) as i64, "lock_stamp": stamp});
+        fs::write(b.home.join("status.json"), st.to_string()).unwrap();
+    };
+    report(0.0, mark(&lock));
     let (code, out) = cli(&b, &mut sys, &["status"]);
     assert_eq!(code, 0);
     assert!(out[0].starts_with(&format!("OK  daemon {} running", VERSION)));
+
+    // The clock is set while the daemon runs. Which report is whose does not hang on what
+    // time it is: the mark on the lock is a number to be found again, not a time to be
+    // earlier or later than.
+    // set back by an hour: the lock's mark is "in the future", the reports go on as ever
+    set_mtime(&lock, now() + 3600.0);
+    report(0.0, mark(&lock));
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 0, "{}", out[0]);
+    assert!(out[0].starts_with("OK  "), "{}", out[0]);
+    // set forward by three days: the lock's mark is long ago, the reports go on as ever
+    set_mtime(&lock, now() - 3.0 * DAY);
+    report(0.0, mark(&lock));
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 0, "{}", out[0]);
+    assert!(out[0].starts_with("OK  "), "{}", out[0]);
+    // ...and neither way round does an earlier daemon's report pass for this one's: a lock
+    // that was taken "before" that report (the clock went back in between), no report yet
+    report(0.0, mark(&lock) + 7);
+    set_mtime(&lock, now() - 30.0);
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 0);
+    assert!(out[0].starts_with("STARTING  "), "{}", out[0]);
+    // a daemon that has not reported, seen after the clock went back: still starting, not stalled
+    set_mtime(&lock, now() + 3600.0);
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 0);
+    assert!(out[0].starts_with("STARTING  "), "{}", out[0]);
+    // its own report that has gone quiet is what "stalled" is, as it always was
+    report(2000.0, mark(&lock));
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 1);
+    assert!(
+        out[0].starts_with(&format!(
+            "STALLED  daemon {} has not reported for 20",
+            VERSION
+        )),
+        "{}",
+        out[0]
+    );
+    // a report without a mark is that of a version before there were marks: taken as it is
+    let st = json!({"pid": 4242, "version": "0.1.2", "heartbeat": now() as i64});
+    fs::write(b.home.join("status.json"), st.to_string()).unwrap();
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 0);
+    assert!(out[0].starts_with("OK  daemon 0.1.2 running"), "{}", out[0]);
     drop(held);
-    // and the daemon itself puts the moment it took the lock on record, and reports at once
+
+    // and the daemon itself marks the lock when it takes it, and reports at once with that mark
     let b = Base::new();
     b.rec(A, "s1", r());
     fs::create_dir_all(&b.home).unwrap();
@@ -105,10 +158,108 @@ fn status_does_not_say_ok_for_a_daemon_that_has_not_reported() {
         .unwrap();
     assert!(winfs::stat(&b.home.join("daemon.lock")).unwrap().mtime() > now() - 60.0);
     s.watch(3600.0, 0.0, 1.0, Some(1), &mut |_| {});
+    assert_eq!(
+        b.status()["lock_stamp"].as_i64(),
+        Some(mark(&b.home.join("daemon.lock")))
+    );
     let (code, out) = cli(&b, &mut sys, &["status"]);
     assert_eq!(code, 0);
     assert!(out[0].starts_with("OK  "), "{}", out[0]);
     drop(lock);
+}
+
+/// A request to settle a conflict that a pass did not get to, because the daemon was told
+/// to end in the middle of it, stays on record: the next daemon carries it out. (It used to
+/// be closed with the pass, as if it had been looked at and found settled.)
+#[test]
+fn a_request_the_pass_did_not_get_to_stays_on_record() {
+    let b = Base::new();
+    fs::remove_dir(b.dir(C)).unwrap();
+    for n in 0..6 {
+        b.rec(A, &format!("s{}", n), r());
+    }
+    // a conflict: A's copy is further along, B's was un-archived later
+    b.rec(
+        A,
+        "abcdef-1",
+        r().last(3.0 * DAY)
+            .mtime(2.0 * DAY)
+            .archived()
+            .title("further along"),
+    );
+    b.rec(
+        B,
+        "abcdef-1",
+        r().last(5.0 * DAY)
+            .mtime(DAY)
+            .title("older, un-archived later"),
+    );
+    let mut s = b.s();
+    assert_eq!(s.plan().notes.conflicts.len(), 1);
+    assert_eq!(s.resolve("abcdef").unwrap(), Some(String::from("abcdef-1")));
+    let asked = b.state()["resolve"].clone();
+    assert_eq!(asked.as_object().unwrap().len(), 1);
+    // where in the pass the request's turn is, and the pass is cut just before it
+    let plan = s.plan();
+    let turn = plan.acts.iter().position(|a| a.fid == "abcdef-1").unwrap();
+    let before_it = if turn == 0 {
+        // (it would be first: have the pass cut before anything is done at all)
+        fs::write(b.home.join("cut-at-once"), b"").unwrap();
+        0
+    } else {
+        turn - 1
+    };
+    let flag = b.home.join("stop.flag");
+    let (at, at_once) = (flag.clone(), turn == 0);
+    s.hooks.before_copy = Some(Box::new(move |copies| {
+        if copies == before_it && !at_once {
+            fs::write(&at, b"").unwrap(); // `stop`, during the change before the request's
+        }
+    }));
+    if at_once {
+        fs::remove_file(b.home.join("cut-at-once")).unwrap();
+        s.hooks.before_plan = Some(Box::new({
+            let at = flag.clone();
+            move || fs::write(&at, b"").unwrap()
+        }));
+    }
+    s.watch(3600.0, 1.0, 1.0, Some(5), &mut |_| {});
+    assert!(s.cut_short);
+    assert_eq!(b.title(B, "abcdef-1"), "older, un-archived later"); // not carried out...
+    assert_eq!(b.state()["resolve"], asked); // ...and still asked for
+                                             // the log says what happened: what was done, and that the pass was stopped, not "in sync"
+    assert_eq!(b.said("in sync"), 0);
+    assert_eq!(b.said("pass stopped before it was done: "), 1);
+    assert_eq!(b.said("synced: added "), usize::from(turn > 0));
+    assert_eq!(b.said("full pass: "), 0);
+    // the next daemon carries it out, and only then is the request done with
+    let mut s = b.s();
+    s.watch(3600.0, 0.0, 1.0, Some(1), &mut |_| {});
+    assert_eq!(b.title(B, "abcdef-1"), "further along");
+    assert_eq!(b.state()["resolve"], json!({}));
+    assert_eq!(s.plan().notes.conflicts.len(), 0);
+    // one that was carried out before the cut is closed by that very pass, as ever
+    let b = Base::new();
+    fs::remove_dir(b.dir(C)).unwrap();
+    b.rec(
+        A,
+        "abcdef-1",
+        r().last(3.0 * DAY).mtime(2.0 * DAY).archived(),
+    );
+    b.rec(B, "abcdef-1", r().last(5.0 * DAY).mtime(DAY));
+    let mut s = b.s();
+    s.resolve("abcdef").unwrap();
+    let flag = b.home.join("stop.flag");
+    s.hooks.before_copy = Some(Box::new(move |_| fs::write(&flag, b"").unwrap()));
+    for n in 0..3 {
+        b.rec(A, &format!("s{}", n), r());
+    }
+    s.watch(3600.0, 1.0, 1.0, Some(5), &mut |_| {});
+    if b.data(B, "abcdef-1") == b.data(A, "abcdef-1") {
+        assert_eq!(b.state()["resolve"], json!({}));
+    } else {
+        assert_eq!(b.state()["resolve"].as_object().unwrap().len(), 1);
+    }
 }
 
 // ---------------------------------------------------------------------- told to end
@@ -530,7 +681,8 @@ fn the_apps_lock_and_its_log_say_it_is_running_when_the_process_list_does_not() 
     assert!(!sync(&b).app_running());
     // the app's lock, held by a process that is there
     let lock = app_dir(&b).join("SingletonLock");
-    symlink(format!("some-host-{}", std::process::id()), &lock).unwrap();
+    let host = crate::process::this_host().unwrap();
+    symlink(format!("{}-{}", host, std::process::id()), &lock).unwrap();
     assert!(sync(&b).app_running());
     // ...so the folder it has loaded is not written into
     b.write_log(&[&Base::login(A, 1)]);
@@ -550,7 +702,7 @@ fn the_apps_lock_and_its_log_say_it_is_running_when_the_process_list_does_not() 
     let gone = child.id();
     child.wait().unwrap();
     fs::remove_file(&lock).unwrap();
-    symlink(format!("some-host-{}", gone), &lock).unwrap();
+    symlink(format!("{}-{}", host, gone), &lock).unwrap();
     assert!(!sync(&b).app_running());
     let mut s = sync(&b);
     s.homes_fn = Some(Box::new(|| Homes::All));

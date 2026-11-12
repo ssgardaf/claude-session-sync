@@ -766,17 +766,22 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
         .map_or_else(|| String::from("?"), |v| shown(Some(v)));
     let beat = num(st.get("heartbeat")).filter(|b| *b != 0.0);
     let age = beat.map(|b| winfs::real_now() - b);
-    // Is the report that of the process that holds the lock now? A daemon puts the moment
-    // it took the lock on record (the lock file's time) and reports at once, so its report
-    // is never older than that; a report that is, was left by a daemon before it. (Whole
-    // seconds in the report, and a clock that was set meanwhile: two seconds' leave.)
-    let taken = winfs::stat(&home.join("daemon.lock"))
-        .ok()
-        .map(|lock| lock.mtime());
-    let reported = beat.is_some_and(|b| taken.is_none_or(|t| b >= t - 2.0));
-    let held_for = taken.map(|t| winfs::real_now() - t);
-    let starting =
-        running && !reported && held_for.is_none_or(|h| (-2.0..START_GRACE_SEC).contains(&h));
+    // Is the report that of the process that holds the lock now? A daemon marks the lock
+    // when it takes it and repeats the mark in every report (see `daemon::stamp`): a report
+    // with another mark was left by a daemon before it. The two are compared as marks, not
+    // as times, so a clock that was set in between, either way, changes nothing. (A report
+    // without a mark is that of a version before there were marks: it is taken as it is.)
+    let lock = fs::metadata(home.join("daemon.lock")).ok();
+    let mark = lock.as_ref().and_then(crate::daemon::lock_mark);
+    let reported = beat.is_some()
+        && match st.get("lock_stamp") {
+            None | Some(Value::Null) => true,
+            Some(theirs) => theirs.as_i64().is_some() && theirs.as_i64() == mark,
+        };
+    // How long the lock has been held without a report: for the first minute that is a
+    // daemon starting. (A time before now means the clock was set back: still starting.)
+    let held_for = mark.map(|m| winfs::real_now() - winfs::ns_to_secs(m));
+    let starting = running && !reported && held_for.is_none_or(|h| h < START_GRACE_SEC);
     // it reports every minute, whatever its settings
     let stalled = running
         && match reported {
@@ -803,7 +808,7 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
             "STALLED",
             format!(
                 "the daemon has not reported since it started {} s ago",
-                held_for.unwrap_or(0.0) as i64
+                held_for.unwrap_or(0.0).max(0.0) as i64
             ),
         )
     } else if stalled {
@@ -866,7 +871,7 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
     if running && !reported {
         con.say(&format!(
             "daemon: holds the lock{}, no report from it yet",
-            held_for.map_or_else(String::new, |h| format!(" (for {} s)", h as i64))
+            held_for.map_or_else(String::new, |h| format!(" (for {} s)", h.max(0.0) as i64))
         ));
     } else if running {
         let pid = st

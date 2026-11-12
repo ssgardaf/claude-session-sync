@@ -132,6 +132,10 @@ pub struct Sync {
     pub aborted: bool,
     /// True while this is the daemon's loop (`watch`): a pass can then be told to end early.
     pub(crate) daemon: bool,
+    /// The mark this daemon put on the lock when it took it (the lock file's time, to the
+    /// last digit the file system kept). It goes into every report, so that `status` can
+    /// tell this daemon's reports from those an earlier one left.
+    pub(crate) lock_stamp: Option<i64>,
     /// The last pass was ended early, between two changes, because the daemon was told to end.
     pub cut_short: bool,
     /// False in the daemon's routine passes: copies we already placed are refreshed at leisure.
@@ -256,6 +260,7 @@ impl Sync {
             last_error: None,
             aborted: false,
             daemon: false,
+            lock_stamp: None,
             cut_short: false,
             urgent: true,
             manifest: BTreeMap::new(),

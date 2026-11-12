@@ -23,7 +23,8 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{
     command_names_the_app, counts_as_ours, desktop_app_running, is_desktop_app, is_the_app,
-    lock_holder, processes, singleton_lock_live, start_time, terminate, this_user, Process,
+    lock_counts, lock_holder, owner, processes, singleton_lock_live, start_time, terminate,
+    this_host, this_user, Process,
 };
 
 /// `(pid, full path or None)` of the running processes whose file name is in `names`

@@ -578,6 +578,14 @@ impl Sync {
             {
                 self.cut_short = true;
                 done.deferred += acts.len() - n;
+                // What the user asked for and this pass did not get to is still owed: the
+                // request stays on record for the next daemon. (Without this it would be
+                // closed below as "looked at, nothing left to settle".)
+                for left in &acts[n..] {
+                    if self.used.contains(&left.fid) {
+                        self.owed.insert(left.fid.clone());
+                    }
+                }
                 break;
             }
             let key = (a.leaf.clone(), a.fid.clone());
