@@ -254,11 +254,13 @@ then off the list (their transcripts stay on disk); `undo` is the gentler way.
 
 - Windows 11 with the Microsoft Store build of the app (5.1231): in daily use across
   several accounts.
-- macOS 26 on Apple silicon with app 1.46388: the whole test suite, the daemon under
-  launchd (install, restart after a crash, pause and resume, uninstall), and the real
-  session store and app log are found and read correctly. Not yet watched on a Mac: an
-  account switch in the app itself. The Intel half of the macOS program is built but
-  has not been run on an Intel Mac.
+- macOS 26 on Apple silicon with app 1.46388: the whole test suite; the released
+  program installed with the line above and run by launchd against the real session
+  store (records mirrored between two accounts, the originals untouched; pause and
+  resume; restart after a crash); the running app is recognised. Not yet watched on a
+  Mac: an account switch in the app itself, so that the app is seen to list the
+  mirrored sessions. The Intel half of the macOS program passes the test suite under
+  Rosetta when a release is built, but has not been run on an Intel Mac.
 
 What "experimental" means for Linux: the program builds, its whole test suite passes
 there, and the daemon was run under a systemd user session against a made-up session
