@@ -611,20 +611,221 @@ mod daemon {
         assert_eq!(fresh.exited(Duration::from_secs(10)), Some(0));
     }
 
-    /// The home folder the tests give the programs is not the real one: what `status` says
-    /// of the autostart is about the throwaway tree, where nothing is installed.
+    /// Stands in for a daemon whose passes take long: this test program itself, started a
+    /// second time by the test below. It watches for the signals the real program watches
+    /// for, takes the lock and runs the daemon's loop, with a twentieth of a second's wait
+    /// before every change it makes. (Run as a test of its own, it does nothing.)
     #[cfg(unix)]
     #[test]
-    fn status_does_not_look_at_the_real_users_autostart() {
+    fn stand_in_for_a_daemon_in_a_long_pass() {
+        let Some(tmp) = std::env::var_os("CSS_TEST_SLOW_DAEMON_TREE").map(PathBuf::from) else {
+            return;
+        };
+        let t = std::mem::ManuallyDrop::new(Tree {
+            root: tmp
+                .join("appdata")
+                .join("Claude")
+                .join("claude-code-sessions"),
+            home: tmp.join("state"),
+            tmp,
+        });
+        claude_session_sync::signals::watch_for_termination();
+        let _lock = acquire_lock(&t.home).unwrap().unwrap();
+        let mut s = Sync::new(t.paths());
+        s.out = Box::new(|_| {});
+        s.hooks.before_copy = Some(Box::new(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+        }));
+        s.watch(3600.0, 1.0, 1.0, None, &mut |seconds| {
+            std::thread::sleep(Duration::from_secs_f64(seconds))
+        });
+        // (0: it was told to end and ended its pass early; 3: it ended some other way)
+        std::process::exit(if s.cut_short { 0 } else { 3 });
+    }
+
+    /// Told to end in the middle of a long pass, the daemon finishes the one change it is
+    /// making and leaves at once, not when the pass is over (launchd waits 20 seconds and
+    /// then kills). Nothing is left half-done, and the next daemon does the rest.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_told_to_end_in_a_long_pass_ends_between_two_changes() {
+        let t = Tree::new();
+        let total = 200; // ten seconds of pass, at a twentieth of a second a change
+        for n in 0..total {
+            t.rec(A, &format!("r{:03}", n));
+        }
+        t.rec(B, "own");
+        let b_dir = t.root.join(B.0).join(B.1);
+        let mirrored = || {
+            file_names(&b_dir)
+                .iter()
+                .filter(|n| n.starts_with("local_r"))
+                .count()
+        };
+        fs::create_dir_all(&t.home).unwrap();
+        let mut slow = Guard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::stand_in_for_a_daemon_in_a_long_pass",
+                    "--test-threads=1",
+                ])
+                .env("CSS_TEST_SLOW_DAEMON_TREE", &t.tmp)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        wait_for("the pass to be under way", Duration::from_secs(30), || {
+            mirrored() >= 5
+        });
+        let told = Instant::now();
+        // SAFETY: the pid is that of the child just started.
+        assert_eq!(
+            unsafe { libc::kill(slow.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        assert_eq!(slow.exited(Duration::from_secs(10)), Some(0));
+        let took = told.elapsed().as_secs_f64();
+        let done = mirrored();
+        assert!(
+            took < 3.0,
+            "{} s: it went on with the pass ({} of {})",
+            took,
+            done,
+            total
+        );
+        assert!(
+            (5..total).contains(&done),
+            "{} of {} were mirrored",
+            done,
+            total
+        );
+        // every copy whole, no temp file, the lock free, the reason in the log
+        for name in file_names(&b_dir) {
+            assert!(!name.starts_with(".sync-"), "{}", name);
+            if name.starts_with("local_r") {
+                assert_eq!(
+                    fs::read(b_dir.join(&name)).unwrap(),
+                    fs::read(t.root.join(A.0).join(A.1).join(&name)).unwrap()
+                );
+            }
+        }
+        assert!(acquire_lock(&t.home).unwrap().is_some());
+        let log = fs::read_to_string(t.home.join("sync.log")).unwrap();
+        assert!(
+            log.trim_end().ends_with("daemon stopped by SIGTERM"),
+            "{}",
+            log
+        );
+        // the real program finishes what was left
+        let (code, out) = t.run(CONSOLE, &["sync"]);
+        assert_eq!(code, 0, "{}", out);
+        assert_eq!(mirrored(), total);
+    }
+
+    /// Whatever the umask of the shell the programs are started from: this tool's own
+    /// folder and every folder in it are the user's alone, and so is every file it writes,
+    /// in that folder and in the store.
+    #[cfg(unix)]
+    #[test]
+    fn what_the_programs_write_is_the_users_alone_under_any_umask() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        fn mode(path: &Path) -> u32 {
+            fs::symlink_metadata(path).unwrap().mode() & 0o7777
+        }
+        fn all_private(dir: &Path, seen: &mut Vec<String>) {
+            for e in fs::read_dir(dir).unwrap().flatten() {
+                let path = e.path();
+                if e.file_type().unwrap().is_dir() {
+                    assert_eq!(mode(&path), 0o700, "{}", path.display());
+                    all_private(&path, seen);
+                } else {
+                    assert_eq!(mode(&path), 0o600, "{}", path.display());
+                    seen.push(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        for umask in ["022", "077", "000", "027"] {
+            let t = Tree::new();
+            t.rec(A, "s1");
+            t.rec(B, "own");
+            // a record as an older app left it, and a copy of it that will be replaced
+            fs::set_permissions(t.path(A, "s1"), fs::Permissions::from_mode(0o644)).unwrap();
+            let under = |args: &str| -> Command {
+                let script = format!("umask {}; exec \"$0\" {}", umask, args);
+                t.program("sh", &["-c", &script, CONSOLE])
+            };
+            let out = under("sync").output().unwrap();
+            assert!(out.status.success(), "umask {}", umask);
+            for copy in [t.path(B, "s1"), t.path(A, "own")] {
+                assert_eq!(mode(&copy), 0o600, "umask {}: {}", umask, copy.display());
+            }
+            assert_eq!(mode(&t.path(A, "s1")), 0o644); // what was only read is as it was
+                                                       // the daemon, too: its lock, its report, its log
+            let mut daemon = Guard(
+                under("daemon --interval 60 --quick 1")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            wait_for("the daemon to come up", Duration::from_secs(30), || {
+                t.status_pid().is_some()
+            });
+            t.rec(A, "later");
+            wait_for("the new record", Duration::from_secs(20), || {
+                t.path(B, "later").exists()
+            });
+            let (code, out) = t.run(CONSOLE, &["stop"]);
+            assert_eq!((code, out.trim()), (0, "stopped"));
+            assert_eq!(daemon.exited(Duration::from_secs(10)), Some(0));
+            assert_eq!(mode(&t.path(B, "later")), 0o600, "umask {}", umask);
+            assert_eq!(mode(&t.home), 0o700, "umask {}", umask);
+            let mut seen = Vec::new();
+            all_private(&t.home, &mut seen);
+            for made in [
+                "sync.log",
+                "journal.jsonl",
+                "manifest.json",
+                "state.json",
+                "status.json",
+                "daemon.lock",
+            ] {
+                assert!(seen.iter().any(|n| n == made), "umask {}: {}", umask, made);
+            }
+            assert!(seen.iter().any(|n| n.ends_with(".zip")), "umask {}", umask);
+        }
+    }
+
+    /// A pipe in the store that nobody writes to (and a link to a device with no end): the
+    /// daemon comes up, says so, makes its backup and its pass, and stops when asked. Before,
+    /// the daily backup stayed in the read of the pipe for ever, with `status` saying OK.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_is_not_held_by_a_pipe_in_the_store() {
         let t = Tree::new();
         t.rec(A, "s1");
+        t.rec(B, "own");
+        let pipe = t.root.join(A.0).join(A.1).join("some.fifo");
+        let c = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        std::os::unix::fs::symlink("/dev/zero", t.root.join(B.0).join(B.1).join("endless"))
+            .unwrap();
+        let mut daemon = t.daemon(CONSOLE, &["daemon", "--interval", "60", "--quick", "1"]);
+        wait_for("the first pass", Duration::from_secs(20), || {
+            t.path(B, "s1").exists() && t.path(A, "own").exists()
+        });
         let (code, out) = t.run(CONSOLE, &["status"]);
-        assert_eq!(code, 1, "{}", out);
-        assert_eq!(
-            out.lines().nth(1),
-            Some("autostart: not installed (to install: claude-session-sync install)"),
-            "{}",
-            out
-        );
+        assert_eq!(code, 0, "{}", out);
+        assert!(out.starts_with("OK  "), "{}", out);
+        assert!(fs::read_dir(t.home.join("backups")).unwrap().count() == 1);
+        let (code, out) = t.run(CONSOLE, &["stop"]);
+        assert_eq!((code, out.trim()), (0, "stopped"));
+        assert_eq!(daemon.exited(Duration::from_secs(10)), Some(0));
+        let log = fs::read_to_string(t.home.join("sync.log")).unwrap();
+        assert!(log.contains("2 thing(s) in the store that are not ordinary files"));
     }
 }

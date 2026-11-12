@@ -44,7 +44,7 @@ What the installer does, so you know:
 |---|---|---|---|
 | The program | two programs in `%USERPROFILE%\.claude-session-sync\bin` | `~/.claude-session-sync/bin/claude-session-sync` | the same as macOS |
 | On your `PATH` | adds that folder to your user `PATH` | links it as `~/.local/bin/claude-session-sync` | the same as macOS |
-| Starts by itself | a scheduled task named `Claude Session Sync` | a launch agent, `~/Library/LaunchAgents/io.github.ssgardaf.claude-session-sync.plist` | a systemd user unit, `~/.config/systemd/user/claude-session-sync.service` |
+| Starts by itself | a scheduled task named `Claude Session Sync` | a launch agent, `~/Library/LaunchAgents/io.github.ssgardaf.claude-session-sync.plist` | a systemd user unit, `claude-session-sync.service`, in the folder your systemd reads user units from (`~/.config/systemd/user`, as a rule) |
 
 In every case the daemon starts when you log in and is started again if it ever stops,
 and the installer checks that it really came up. Nothing else is changed: on macOS and
@@ -93,7 +93,10 @@ Notes:
   [build it yourself](#build-from-source).
 - Linux without a systemd user session (some containers and minimal setups): the
   program is installed, but nothing can start the daemon by itself. `install` says so
-  and shows the command to run the daemon yourself.
+  and shows the command to run the daemon yourself, and `status` says so from then on.
+- Linux: systemd cannot start a program from a folder with a quote or a backslash in
+  its name. `install` says so before it changes anything; keep the tool's folder
+  somewhere else (`CLAUDE_SESSION_SYNC_HOME`).
 
 ## Everyday use
 
@@ -109,7 +112,7 @@ autostart: installed (scheduled task "Claude Session Sync")
 ...
 ```
 
-The first line is the summary (`OK`, `PAUSED`, `STALLED` or `NOT RUNNING`); below it are
+The first line is the summary (`OK`, `STARTING`, `PAUSED`, `STALLED` or `NOT RUNNING`); below it are
 the details: what is pending, anything left alone on purpose, and the last log lines.
 
 | I want to | Command |
@@ -197,7 +200,15 @@ are skipped, since they could not be resumed anyway.
 - It does not link folders together. Current app builds refuse to save into a linked
   folder, which silently loses new sessions.
 - Told to stop (by you, by a logout, by the system shutting down), the daemon finishes
-  the change it is making first.
+  the change it is making and begins no other, also in the middle of a long pass.
+- Only ordinary files are read. A pipe, a socket or a device in the store (or a link to
+  one) is never opened, and is left out of the backup; nothing is read without a limit.
+- On macOS and Linux everything it writes is yours alone to read: its own folder and
+  the folders in it (mode 0700), its log, journal, backups and kept versions (0600),
+  and the records it puts in the store (0600, as the app writes its own), whatever the
+  umask. What an earlier version left readable by others is narrowed the next time the
+  daemon starts or `install` runs. Only the launch agent and the systemd unit, which
+  hold nothing private, are readable by all.
 - It never uses the network.
 
 Its own files are in `%USERPROFILE%\.claude-session-sync` (Windows) or
@@ -259,6 +270,18 @@ store is somewhere else, `preview` says it was not found and changes nothing; na
 folder in `CLAUDE_SESSION_SYNC_STORE`. Start with `claude-session-sync preview` and
 please report what you find.
 
+**Is the app running?** The records in the folder the app has loaded are not replaced
+while it runs, so this is answered cautiously on every system: when in doubt, it is
+running. It counts as running if one of your own processes is the app's program
+(Windows: `claude.exe` from the app's install folder; macOS: a program called `Claude`
+in the `Contents/MacOS` of any application bundle, so a renamed or second copy counts
+too; Linux: `claude-desktop` or `claude` with the app's bundle beside it, or any
+Electron program whose command line names an `app.asar` with "claude" in its path), or,
+on macOS and Linux, if the lock the app's engine keeps in its data folder
+(`SingletonLock`) names a process that is there, or if the app's log was written
+moments ago (on Linux, where the rest is a guess: in the last 10 minutes). Another
+user's app does not count: it has its own store.
+
 Differences between the systems that you may notice:
 
 - **Coming back after `stop`.** `stop` ends the daemon for the moment; what starts it
@@ -274,6 +297,10 @@ Differences between the systems that you may notice:
 - **macOS: `pause`** disables the launch agent in launchd's own records, by name.
   `resume`, `install` and `uninstall` lift that again; launchd keeps listing the name as
   enabled afterwards, which has no effect.
+- **`pause`, `uninstall` and `status` go by what launchd or systemd say**, not by which
+  files are there. A daemon whose agent or unit file was deleted while it runs is still
+  stopped and taken away properly, one that was disabled by hand while it runs is not
+  taken for paused, and "stopped" is only said once launchd or systemd agree.
 
 ## Limits
 
@@ -324,8 +351,12 @@ Settings). On macOS and Linux, set them in the shell you run `install` from: tho
 are set at that moment are written into the launch agent or the systemd unit, and
 `install` says so. Commands you run later (`status`, `undo`, ...) look in the same
 places only if the variables are set then as well. On macOS and Linux the program
-itself is put in the `bin` folder of `CLAUDE_SESSION_SYNC_HOME`; Linux also honours
-`XDG_CONFIG_HOME` when it looks for the app's folder.
+itself is put in the `bin` folder of `CLAUDE_SESSION_SYNC_HOME`.
+
+Linux: `XDG_CONFIG_HOME`, if it is set, says where the app's folder is looked for, and
+is handed on to the daemon in the same way. It does not decide where the systemd unit
+goes: that is the folder the running systemd reads user units from, which `install`
+asks it for.
 
 ## Build from source
 

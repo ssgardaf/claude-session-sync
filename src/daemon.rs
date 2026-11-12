@@ -91,7 +91,7 @@ impl Sync {
         if let Some(hook) = self.hooks.on_status.as_mut() {
             hook();
         }
-        if fs::create_dir_all(&self.p.home).is_ok() {
+        if winfs::make_dirs(&self.p.home).is_ok() {
             let data = ordered_json(fields).into_bytes();
             let _ = winfs::atomic_write(&self.home("status.json"), &data, None, false, Expect::Any);
         }
@@ -189,7 +189,7 @@ impl Sync {
                 if let Some(hook) = self.hooks.after_run.as_mut() {
                     hook();
                 }
-                if lp.done.wrote() == 0 {
+                if lp.done.wrote() == 0 || self.cut_short {
                     break;
                 }
                 wrote_any = true;
@@ -241,7 +241,7 @@ impl Sync {
         sleep: &mut dyn FnMut(f64),
     ) {
         self.stop_requested(); // a flag left by an earlier stop must not end this run
-        crate::watchdog::beat(); // the loop has begun: from here on it is expected to come round
+        self.daemon = true;
         let mut lp = Loop {
             interval,
             quick,
@@ -270,6 +270,10 @@ impl Sync {
                 ""
             }
         ));
+        // The first sign of life comes before the first pass, not after it: a pass that hangs
+        // (or merely takes long) is then that of a daemon known to have started, to `status`,
+        // to the takeover on Windows and to the watchdog elsewhere.
+        self.beat(&mut lp);
         loop {
             let now = self.now();
             let due_full = !(0.0..interval).contains(&(now - lp.last_full)); // also true if the clock went backwards
@@ -288,6 +292,7 @@ impl Sync {
             loops += 1;
             self.urgent = true; // whatever is run outside this loop is a pass in its own right
             if max_loops.is_some_and(|m| loops >= m) {
+                self.daemon = false;
                 return;
             }
             let mut wait = if quick != 0.0 { quick } else { interval };
@@ -315,11 +320,13 @@ impl Sync {
                     // told to end by the system (a stop, a logout) or from the keyboard
                     self.report(&mut lp, true);
                     self.log(&format!("daemon stopped by {}", signal));
+                    self.daemon = false;
                     return;
                 }
                 if self.stop_requested() {
                     self.report(&mut lp, true);
                     self.log("daemon stopped on request");
+                    self.daemon = false;
                     return;
                 }
                 let left = end - self.now();
@@ -405,12 +412,11 @@ fn unlock(file: &File) {
 /// Take the single-instance lock on `daemon.lock`, exclusively, without waiting.
 /// None if another process (or handle) holds it.
 pub fn acquire_lock(home: &Path) -> io::Result<Option<Lock>> {
-    fs::create_dir_all(home)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(home.join("daemon.lock"))?;
+    winfs::make_dirs(home)?;
+    let file = winfs::open_own(
+        OpenOptions::new().read(true).append(true).create(true),
+        &home.join("daemon.lock"),
+    )?;
     if !try_lock(&file) {
         return Ok(None);
     }
@@ -472,6 +478,12 @@ fn holder(home: &Path) -> Option<Holder> {
     })
 }
 
+/// Put on record when the daemon took the lock: the lock file's own time. `status` goes by
+/// it to tell a daemon that has reported since it started from one that has not.
+fn stamp(lock: &Lock) {
+    let _ = lock.file.set_modified(std::time::SystemTime::now());
+}
+
 /// The lock for the daemon. A `status` or `stop` may hold it for a moment, so try for a few
 /// seconds; and if the daemon that holds it has not given a sign of life for STALL_SEC, end it
 /// and take its place.
@@ -485,6 +497,7 @@ pub fn lock_for_daemon(s: &mut Sync, sleep: &dyn Fn(f64)) -> io::Result<Option<L
     let home = s.p.home.clone();
     for _attempt in 0..12 {
         if let Some(lock) = acquire_lock(&home)? {
+            stamp(&lock);
             return Ok(Some(lock));
         }
         if let Some(h) = holder(&home) {
@@ -522,6 +535,7 @@ pub fn lock_for_daemon(s: &mut Sync, sleep: &dyn Fn(f64)) -> io::Result<Option<L
     for _ in 0..20 {
         sleep(0.5);
         if let Some(lock) = acquire_lock(&home)? {
+            stamp(&lock);
             return Ok(Some(lock));
         }
     }

@@ -1,4 +1,19 @@
 //! The process list on macOS (libproc) and Linux (`/proc`).
+//!
+//! Whether the desktop app is running decides whether the records in the folder it has
+//! loaded may be replaced, so the question is answered cautiously: where there is doubt, the
+//! app is running. It is taken to be running if any of these holds:
+//!
+//! * a process of this user runs the app's own program (macOS: a program called `Claude` in
+//!   the `Contents/MacOS` folder of any application bundle; Linux: a program called
+//!   `claude-desktop` or `claude` with the app's bundle beside it, or any program, such as
+//!   `electron`, whose command line names an `app.asar` with "claude" in its path);
+//! * the lock Chromium keeps in the app's data folder while it runs (`SingletonLock`, a link
+//!   whose target ends in the process's number) names a process that is there;
+//! * the process list cannot be read.
+//!
+//! Processes of other users do not count: their app has its own store. A process whose
+//! owner cannot be told does.
 
 use std::path::Path;
 
@@ -10,11 +25,27 @@ fn program_name(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `(pid, full path of its program)` of every process whose program can be told. Processes
-/// of other users may be missing: their programs cannot always be asked for. None if the
-/// list could not be read at all.
+/// A running process, as far as it can be told.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Process {
+    pub pid: u32,
+    /// The full path of its program; empty if that cannot be told.
+    pub path: String,
+    /// The user it runs as, if that can be told.
+    pub owner: Option<u32>,
+    /// Its command line (Linux; empty elsewhere and where it cannot be read).
+    pub command: Vec<String>,
+}
+
+/// The user this process runs as.
+pub fn this_user() -> u32 {
+    // SAFETY: a call without arguments that cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// Every running process whose program can be told. None if the list could not be read.
 #[cfg(target_os = "macos")]
-fn all_processes() -> Option<Vec<(u32, String)>> {
+fn all_processes() -> Option<Vec<Process>> {
     // SAFETY: the buffers are valid for the sizes passed, and the calls write no more.
     unsafe {
         let wanted = libc::proc_listallpids(std::ptr::null_mut(), 0);
@@ -37,16 +68,44 @@ fn all_processes() -> Option<Vec<(u32, String)>> {
             }
             let n = libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32);
             if n > 0 {
-                let path = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
-                out.push((pid as u32, path));
+                out.push(Process {
+                    pid: pid as u32,
+                    path: String::from_utf8_lossy(&buf[..n as usize]).into_owned(),
+                    owner: owner(pid as u32),
+                    command: Vec::new(),
+                });
             }
         }
         Some(out)
     }
 }
 
+/// The user a process runs as. None if that cannot be told.
+#[cfg(target_os = "macos")]
+fn owner(pid: u32) -> Option<u32> {
+    bsd_info(pid).map(|info| info.pbi_uid)
+}
+
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    // SAFETY: proc_bsdinfo is plain data, and the call is told its size.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        );
+        (got == size).then_some(info)
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
-fn all_processes() -> Option<Vec<(u32, String)>> {
+fn all_processes() -> Option<Vec<Process>> {
+    use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
@@ -56,13 +115,29 @@ fn all_processes() -> Option<Vec<(u32, String)>> {
         else {
             continue;
         };
-        // (not to be read for a process of another user, or one that has just ended)
-        if let Ok(exe) = std::fs::read_link(entry.path().join("exe")) {
-            let path = exe.to_string_lossy().into_owned();
-            // a program that was replaced on disk while it runs is listed with this ending
-            let path = path.strip_suffix(" (deleted)").unwrap_or(&path).to_string();
-            out.push((pid, path));
-        }
+        let dir = entry.path();
+        // (the program of another user's process is not to be read, nor that of one that has
+        // just ended; a program replaced on disk while it runs is listed with this ending)
+        let path = std::fs::read_link(dir.join("exe"))
+            .map(|exe| {
+                let text = exe.to_string_lossy().into_owned();
+                text.strip_suffix(" (deleted)").unwrap_or(&text).to_string()
+            })
+            .unwrap_or_default();
+        let command = std::fs::read(dir.join("cmdline"))
+            .map(|raw| {
+                raw.split(|b| *b == 0)
+                    .filter(|word| !word.is_empty())
+                    .map(|word| String::from_utf8_lossy(word).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(Process {
+            pid,
+            path,
+            owner: std::fs::metadata(&dir).ok().map(|md| md.uid()),
+            command,
+        });
     }
     Some(out)
 }
@@ -73,18 +148,19 @@ pub fn processes(names: &[&str]) -> Option<Vec<(u32, Option<String>)>> {
     Some(
         all_processes()?
             .into_iter()
-            .filter(|(_, path)| names.contains(&program_name(path).as_str()))
-            .map(|(pid, path)| (pid, Some(path)))
+            .filter(|p| !p.path.is_empty() && names.contains(&program_name(&p.path).as_str()))
+            .map(|p| (p.pid, Some(p.path)))
             .collect(),
     )
 }
 
-/// Is this the desktop app's own program? Its helpers do not count (the browser's
-/// native-messaging host stays behind when the app is closed), nor does the command-line
-/// tool of the same name.
+/// Is this the desktop app's own program? Any application bundle's main program called
+/// `Claude` is (the app may have been renamed or installed twice: `Claude 2.app`, `Claude
+/// Beta.app`). Its helpers are not (the browser's native-messaging host stays behind when
+/// the app is closed), nor is the command-line tool, which is no bundle's main program.
 #[cfg(target_os = "macos")]
 pub fn is_desktop_app(path: &str) -> bool {
-    path.ends_with("/Claude.app/Contents/MacOS/Claude")
+    path.ends_with(".app/Contents/MacOS/Claude")
 }
 
 /// Is this the desktop app's own program? It is called `claude-desktop` (or `claude`) and,
@@ -100,34 +176,70 @@ pub fn is_desktop_app(path: &str) -> bool {
     })
 }
 
+/// Does a command line name the Claude app's bundle: an `app.asar` with "claude" somewhere
+/// in its path? That is how the app looks when a general Electron program runs it
+/// (`electron /usr/lib/claude-desktop/app.asar`), and how its helper processes look.
+pub fn command_names_the_app(command: &[String]) -> bool {
+    command.iter().any(|word| {
+        let word = word.to_lowercase();
+        word.contains("app.asar") && word.contains("claude")
+    })
+}
+
+/// Does a process count for the question whether this user's app is running? One of
+/// another user does not; one whose owner cannot be told does.
+pub fn counts_as_ours(owner: Option<u32>, me: u32) -> bool {
+    owner.is_none_or(|uid| uid == me)
+}
+
+/// Is this process the desktop app (of this user)?
+pub fn is_the_app(process: &Process, me: u32) -> bool {
+    counts_as_ours(process.owner, me)
+        && (is_desktop_app(&process.path) || command_names_the_app(&process.command))
+}
+
 /// True if the Claude desktop app has a process. When that cannot be told, true (the
 /// cautious answer).
 pub fn desktop_app_running() -> bool {
+    let me = this_user();
     match all_processes() {
-        Some(found) => found.iter().any(|(_, path)| is_desktop_app(path)),
+        Some(found) => found.iter().any(|p| is_the_app(p, me)),
         None => true,
     }
+}
+
+/// The process number at the end of a `SingletonLock` link's target (`<host>-<pid>`).
+pub fn lock_holder(target: &str) -> Option<u32> {
+    let (_, pid) = target.rsplit_once('-')?;
+    pid.parse().ok().filter(|pid| *pid > 0)
+}
+
+/// Is the lock Chromium keeps in the app's data folder while it runs held by a process that
+/// is there? (The lock is a link, not a file; a link left by an app that was killed names a
+/// process that is gone, or by now another one: that is taken for the app, the cautious way
+/// round.)
+pub fn singleton_lock_live(app_dir: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(app_dir.join("SingletonLock")) else {
+        return false;
+    };
+    lock_holder(&target.to_string_lossy()).is_some_and(exists)
+}
+
+/// Is there a process of this number (whoever it belongs to)?
+fn exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only asks whether the process is there. (A process
+    // that may not be signalled is there all the same.)
+    let asked = unsafe { libc::kill(pid, 0) };
+    asked == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// When a process was started, in seconds since 1970. None if that cannot be told.
 #[cfg(target_os = "macos")]
 pub fn start_time(pid: u32) -> Option<f64> {
-    // SAFETY: proc_bsdinfo is plain data, and the call is told its size.
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let got = libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        );
-        if got != size {
-            return None;
-        }
-        Some(info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1e6)
-    }
+    bsd_info(pid).map(|info| info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1e6)
 }
 
 /// The time on one of the system's clocks, in seconds.
@@ -197,8 +309,19 @@ pub fn terminate(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "css-proc-unit-{}-{}-{}",
+            name,
+            std::process::id(),
+            (crate::winfs::real_now() * 1e6) as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
-    fn this_process_is_on_the_list_under_its_programs_name() {
+    fn this_process_is_on_the_list_under_its_programs_name_and_as_this_users() {
         let me = std::process::id();
         let exe = std::env::current_exe().unwrap();
         let name = exe.file_name().unwrap().to_string_lossy().to_lowercase();
@@ -209,16 +332,31 @@ mod tests {
             .as_ref()
             .is_some_and(|p| p.ends_with(exe.file_name().unwrap().to_string_lossy().as_ref())));
         assert!(processes(&["no-such-program-anywhere"]).unwrap().is_empty());
+        let all = all_processes().unwrap();
+        let this = all.iter().find(|p| p.pid == me).unwrap();
+        assert_eq!(this.owner, Some(this_user()));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!this.command.is_empty());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn only_the_apps_own_program_counts_as_the_app() {
+    fn any_bundles_main_program_called_claude_counts_as_the_app() {
         assert!(is_desktop_app(
             "/Applications/Claude.app/Contents/MacOS/Claude"
         ));
         assert!(is_desktop_app(
             "/Users/someone/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        // installed twice, or renamed: when in doubt, it is the app
+        assert!(is_desktop_app(
+            "/Applications/Claude 2.app/Contents/MacOS/Claude"
+        ));
+        assert!(is_desktop_app(
+            "/Applications/Claude Beta.app/Contents/MacOS/Claude"
+        ));
+        assert!(is_desktop_app(
+            "/Volumes/Somewhere/Anything.app/Contents/MacOS/Claude"
         ));
         // the browser's helper stays behind when the app is closed
         assert!(!is_desktop_app(
@@ -227,25 +365,25 @@ mod tests {
         assert!(!is_desktop_app(
             "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper"
         ));
-        // the command-line tool, and other apps
-        assert!(!is_desktop_app("/Users/someone/.local/bin/claude"));
-        assert!(!is_desktop_app("/opt/homebrew/bin/claude"));
         assert!(!is_desktop_app(
-            "/Applications/NotClaude.app/Contents/MacOS/NotClaude"
+            "/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer)"
         ));
         assert!(!is_desktop_app(
             "/Applications/Claude.app/Contents/MacOS/Claude Helper"
+        ));
+        // the command-line tool, and other apps
+        assert!(!is_desktop_app("/Users/someone/.local/bin/claude"));
+        assert!(!is_desktop_app("/opt/homebrew/bin/claude"));
+        assert!(!is_desktop_app("/usr/local/Contents/MacOS/Claude"));
+        assert!(!is_desktop_app(
+            "/Applications/NotClaude.app/Contents/MacOS/NotClaude"
         ));
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn the_app_is_told_from_the_command_line_tool_by_what_is_beside_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "css-proc-unit-{}-{}",
-            std::process::id(),
-            (crate::winfs::real_now() * 1e6) as u64
-        ));
+        let dir = scratch("layout");
         let app = dir.join("opt").join("Claude");
         std::fs::create_dir_all(app.join("resources")).unwrap();
         std::fs::write(app.join("resources").join("app.asar"), b"").unwrap();
@@ -258,6 +396,93 @@ mod tests {
         assert!(!is_desktop_app(&text(cli.join("claude")))); // the command-line tool
         assert!(!is_desktop_app(&text(cli.join("claude-desktop"))));
         assert!(!is_desktop_app("claude"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_command_line_that_names_the_apps_bundle_is_the_app() {
+        let words = |text: &[&str]| -> Vec<String> { text.iter().map(|w| w.to_string()).collect() };
+        assert!(command_names_the_app(&words(&[
+            "/usr/bin/electron",
+            "/usr/lib/claude-desktop/app.asar"
+        ])));
+        assert!(command_names_the_app(&words(&[
+            "electron33",
+            "--no-sandbox",
+            "/opt/Claude/resources/app.asar",
+            "--some-flag"
+        ])));
+        // a helper of the app, as Electron starts it
+        assert!(command_names_the_app(&words(&[
+            "/proc/self/exe",
+            "--type=renderer",
+            "--app-path=/opt/CLAUDE/resources/app.asar"
+        ])));
+        // other Electron apps, the command-line tool, nothing at all
+        assert!(!command_names_the_app(&words(&[
+            "/usr/bin/electron",
+            "/usr/lib/some-editor/app.asar"
+        ])));
+        assert!(!command_names_the_app(&words(&["claude", "--resume"])));
+        assert!(!command_names_the_app(&words(&[
+            "node",
+            "/home/someone/.claude/local/cli.js"
+        ])));
+        assert!(!command_names_the_app(&[]));
+    }
+
+    #[test]
+    fn only_this_users_processes_count_and_those_nobody_can_place() {
+        assert!(counts_as_ours(Some(501), 501));
+        assert!(!counts_as_ours(Some(502), 501)); // another user's app has its own store
+        assert!(!counts_as_ours(Some(0), 501));
+        assert!(counts_as_ours(None, 501)); // no telling whose: it counts
+        let app = |owner| Process {
+            pid: 4242,
+            path: String::from("/somewhere/else"),
+            owner,
+            command: vec![
+                String::from("electron"),
+                String::from("/usr/lib/claude-desktop/app.asar"),
+            ],
+        };
+        assert!(is_the_app(&app(Some(501)), 501));
+        assert!(is_the_app(&app(None), 501));
+        assert!(!is_the_app(&app(Some(502)), 501));
+        let other = Process {
+            command: vec![String::from("vim")],
+            ..app(Some(501))
+        };
+        assert!(!is_the_app(&other, 501));
+    }
+
+    #[test]
+    fn the_apps_own_lock_says_it_is_running_while_its_process_is_there() {
+        assert_eq!(lock_holder("some-host-4242"), Some(4242));
+        assert_eq!(lock_holder("host.with-dashes.example-17"), Some(17));
+        assert_eq!(lock_holder("no number"), None);
+        assert_eq!(lock_holder("host-"), None);
+        assert_eq!(lock_holder("host-0"), None);
+        assert_eq!(lock_holder("host--5"), Some(5));
+        let dir = scratch("lock");
+        let lock = dir.join("SingletonLock");
+        assert!(!singleton_lock_live(&dir)); // no lock: no app
+                                             // held by a process that is there (this one)
+        std::os::unix::fs::symlink(format!("some-host-{}", std::process::id()), &lock).unwrap();
+        assert!(singleton_lock_live(&dir));
+        // left behind by a process that is gone
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(format!("some-host-{}", gone), &lock).unwrap();
+        assert!(!singleton_lock_live(&dir));
+        // an ordinary file of that name is not the lock
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, format!("some-host-{}", std::process::id())).unwrap();
+        assert!(!singleton_lock_live(&dir));
+        // a process that is there but not this user's to signal is there all the same
+        assert!(exists(1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

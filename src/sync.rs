@@ -2,7 +2,7 @@
 //! (log, journal, manifest, state).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, DirEntry, OpenOptions};
+use std::fs::{self, DirEntry};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -130,6 +130,10 @@ pub struct Sync {
     pub notes: Notes,
     pub last_error: Option<String>,
     pub aborted: bool,
+    /// True while this is the daemon's loop (`watch`): a pass can then be told to end early.
+    pub(crate) daemon: bool,
+    /// The last pass was ended early, between two changes, because the daemon was told to end.
+    pub cut_short: bool,
     /// False in the daemon's routine passes: copies we already placed are refreshed at leisure.
     pub urgent: bool,
     /// normalised path -> [mtime_ns, size, lastActivityAt, sha, user key]: what this tool last wrote there
@@ -251,6 +255,8 @@ impl Sync {
             notes: Notes::default(),
             last_error: None,
             aborted: false,
+            daemon: false,
+            cut_short: false,
             urgent: true,
             manifest: BTreeMap::new(),
             dirty: false,
@@ -343,7 +349,7 @@ impl Sync {
             return;
         }
         let _ = (|| -> io::Result<()> {
-            fs::create_dir_all(&self.p.home)?;
+            winfs::make_dirs(&self.p.home)?;
             let path = self.home("sync.log");
             if fs::metadata(&path)
                 .map(|m| m.len() > 2_000_000)
@@ -351,7 +357,7 @@ impl Sync {
             {
                 winfs::replace(&path, &self.home("sync.log.1"))?;
             }
-            let mut fh = OpenOptions::new().append(true).create(true).open(&path)?;
+            let mut fh = winfs::append_file(&path)?;
             fh.write_all(format!("{}\n", line).as_bytes())
         })();
     }
@@ -367,7 +373,7 @@ impl Sync {
         {
             winfs::replace(&path, &self.home("journal.jsonl.1"))?;
         }
-        let mut fh = OpenOptions::new().append(true).create(true).open(&path)?;
+        let mut fh = winfs::append_file(&path)?;
         fh.write_all(format!("{}\n", ordered_json(&items)).as_bytes())
     }
 
@@ -408,10 +414,7 @@ impl Sync {
     fn manifest_line(&mut self, key: &str, value: &Value) {
         self.dirty = true;
         let _ = (|| -> io::Result<()> {
-            let mut fh = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(self.home("manifest.log"))?;
+            let mut fh = winfs::append_file(&self.home("manifest.log"))?;
             fh.write_all(format!("{}\n", json!([key, value])).as_bytes())
         })();
     }
@@ -424,7 +427,7 @@ impl Sync {
                 Err(WriteError::Io(e)) => return Err(e),
                 Err(WriteError::Changed) => return Err(io::Error::other("manifest.json changed")),
             }
-            let _ = fs::File::create(self.home("manifest.log"));
+            let _ = winfs::create_file(&self.home("manifest.log"));
             self.dirty = false;
         }
         Ok(())
@@ -536,7 +539,7 @@ impl Sync {
     }
 
     pub(crate) fn write_state(&self, st: &Map<String, Value>) -> io::Result<()> {
-        fs::create_dir_all(&self.p.home)?;
+        winfs::make_dirs(&self.p.home)?;
         let data = serde_json::to_vec(st).map_err(io::Error::other)?;
         match winfs::atomic_write(&self.home("state.json"), &data, None, true, Expect::Any) {
             Ok(()) => Ok(()),
@@ -715,12 +718,22 @@ impl Sync {
                 Some(probe) => probe(),
                 None => process::desktop_app_running(),
             };
+            // The process test knows the app by its program; should that ever miss, there
+            // are two more signs, and either one says it is running all the same.
+            #[cfg(unix)]
             if !running {
-                // the process test knows the app by where it is installed; should that ever
-                // change, an app log that is still being written says it is running all the same
+                // the lock Chromium keeps in the app's data folder (the store's parent)
+                running = self
+                    .p
+                    .root
+                    .parent()
+                    .is_some_and(process::singleton_lock_live);
+            }
+            if !running {
+                // an app log that is still being written
                 if let Some(newest) = self.applog.current() {
                     let age = winfs::real_now() - winfs::ns_to_secs(newest.1);
-                    running = -60.0 < age && age < 20.0; // (file clocks can run a little ahead)
+                    running = -60.0 < age && age < APP_LOG_FRESH_SEC; // (file clocks can run a little ahead)
                 }
             }
             self.app_seen = (self.now(), running);

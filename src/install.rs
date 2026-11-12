@@ -55,7 +55,8 @@ pub const SETUP_TASK_NAME: &str = "Claude Session Sync (setup)";
 pub const PATH_RESULT: &str = "path-result.txt";
 
 /// This tool's own files in its state folder: what `uninstall --purge` deletes there.
-const OWN_FILES: [&str; 13] = [
+const OWN_FILES: [&str; 14] = [
+    "no-autostart",
     "settings.json",
     "setup-task.xml",
     "sync.log",
@@ -124,7 +125,7 @@ pub fn load_settings(home: &Path) -> Option<Settings> {
 }
 
 pub fn save_settings(home: &Path, s: &Settings) -> io::Result<()> {
-    fs::create_dir_all(home)?;
+    winfs::make_dirs(home)?;
     let text = serde_json::json!({
         "interval": s.interval,
         "quick": s.quick,
@@ -605,9 +606,13 @@ pub enum Autostart {
     /// There is no scheduled task, and this process is inside the app's sandbox, from where
     /// a start-up entry cannot be seen.
     NoTaskSeen,
-    /// The launch agent's or the unit's file is there, but the system has not taken it up.
+    /// The launch agent's or the unit's file is there, but the system has not taken it up
+    /// as it was installed (not loaded; disabled by hand while it runs; masked).
     #[cfg(unix)]
     NotLoaded,
+    /// launchd or systemd runs the daemon, but the file that tells them of it is gone.
+    #[cfg(unix)]
+    NoFile,
     /// There is nothing here to start the daemon with (Linux without a systemd user session).
     #[cfg(unix)]
     NoManager,
@@ -718,9 +723,9 @@ pub fn path_command(sys: &mut dyn System, exe: &Path, add: bool) -> i32 {
 /// Ask a running daemon to exit (the stop flag) and wait until the lock is free.
 /// True if no daemon holds the lock any more.
 pub fn stop_daemon(home: &Path, tries: usize, sleep: &mut dyn FnMut(f64)) -> io::Result<bool> {
-    fs::create_dir_all(home)?;
+    winfs::make_dirs(home)?;
     let flag = home.join("stop.flag");
-    fs::File::create(&flag)?;
+    winfs::create_file(&flag)?;
     for _ in 0..tries {
         if let Some(lock) = acquire_lock(home)? {
             drop(lock);

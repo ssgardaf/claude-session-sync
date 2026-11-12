@@ -95,7 +95,8 @@ impl AppLog {
         let mut fh = winfs::open_shared(path)?;
         fh.seek(SeekFrom::Start(start))?;
         let mut data = Vec::new();
-        fh.read_to_end(&mut data)?;
+        fh.take(crate::consts::MAX_READ_BYTES)
+            .read_to_end(&mut data)?;
         // leave a line that is still being written for next time
         let end = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         Ok((events_in(&data[..end]).pop(), start + end as u64))

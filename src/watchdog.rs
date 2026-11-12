@@ -133,11 +133,7 @@ fn give_up(home: PathBuf, age: f64) -> ! {
         .spawn(move || {
             use std::io::Write;
             let stamp = crate::winfs::local_format(crate::winfs::real_now(), "%Y-%m-%d %H:%M:%S");
-            if let Ok(mut log) = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(home.join("sync.log"))
-            {
+            if let Ok(mut log) = crate::winfs::append_file(&home.join("sync.log")) {
                 let _ = log.write_all(format!("{} {}\n", stamp, line).as_bytes());
             }
             let _ = done.send(());

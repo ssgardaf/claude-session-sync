@@ -106,7 +106,7 @@ impl Sync {
     /// Zip the whole store once a day, before the first write. An error means: write nothing.
     pub fn backup_if_needed(&mut self) -> Result<Option<PathBuf>, String> {
         let bdir = self.home("backups");
-        fs::create_dir_all(&bdir).map_err(e2s)?;
+        winfs::make_dirs(&bdir).map_err(e2s)?;
         let day = winfs::local_format(self.now(), "%Y%m%d");
         let names = |dir: &Path| -> Result<Vec<String>, String> {
             let mut out = Vec::new();
@@ -135,10 +135,22 @@ impl Sync {
         let mut files = Vec::new();
         walk_files(&root, &mut files);
         let mut count = 0usize;
+        let mut left_out = 0usize;
         {
-            let fh = File::create(&tmp).map_err(e2s)?;
+            let fh = winfs::create_file(&tmp).map_err(e2s)?;
             let mut z = zip::ZipWriter::new(fh);
             for full in files {
+                // Only ordinary files are kept, and none that is out of all proportion: a
+                // pipe would hold the read for ever, a device may have no end, and neither
+                // is anything the app keeps here.
+                match winfs::stat(&full) {
+                    Ok(st) if !st.is_file || st.size > MAX_BACKUP_FILE_BYTES => {
+                        left_out += 1;
+                        continue;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    _ => {}
+                }
                 let mut found: Option<(Stat, Vec<u8>)> = None;
                 let mut gone = false;
                 for _attempt in 0..4 {
@@ -204,6 +216,13 @@ impl Sync {
             }
         }
         winfs::replace(&tmp, &bdir.join(&name)).map_err(e2s)?;
+        if left_out > 0 {
+            self.log(&format!(
+                "backup: {} thing(s) in the store that are not ordinary files, or are larger than {} MB, were left out",
+                left_out,
+                MAX_BACKUP_FILE_BYTES / (1024 * 1024)
+            ));
+        }
         let mut zips: Vec<String> = names(&bdir)?
             .into_iter()
             .filter(|n| n.ends_with(".zip"))
@@ -252,7 +271,7 @@ impl Sync {
     fn preserve(&self, leaf: &str, path: &Path, st: &Stat) -> io::Result<PathBuf> {
         let day = winfs::local_format(self.now(), "%Y%m%d");
         let kept_dir = self.home("replaced").join(day).join(leaf.replace('/', "_"));
-        fs::create_dir_all(&kept_dir)?;
+        winfs::make_dirs(&kept_dir)?;
         let base = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -265,7 +284,7 @@ impl Sync {
             ));
         }
         {
-            let mut fh = File::create(&kept)?;
+            let mut fh = winfs::create_file(&kept)?;
             fh.write_all(&data)?;
             fh.flush()?;
             fh.sync_all()?;
@@ -448,7 +467,7 @@ impl Sync {
         }
         let ts = act.ts.unwrap_or(0);
         let qdir = self.home("quarantine").join(act.leaf.replace('/', "_"));
-        fs::create_dir_all(&qdir).map_err(e2s)?;
+        winfs::make_dirs(&qdir).map_err(e2s)?;
         let base = r
             .path
             .file_name()
@@ -477,11 +496,12 @@ impl Sync {
         .map_err(e2s)?;
         for marker in &todo {
             // markers first: a crash in between must not look like a live session
-            fs::write(marker, ts.to_string()).map_err(e2s)?;
+            winfs::write_file(marker, ts.to_string().as_bytes()).map_err(e2s)?;
             let ms = winfs::stat(marker).map_err(e2s)?;
             self.mark_ours(marker, ms.mtime_ns, ms.size, None, None, None);
         }
         winfs::move_file(&r.path, &q).map_err(e2s)?;
+        let _ = winfs::make_private(&q); // (it keeps the mode it had in the store)
         self.forget(&r.path);
         Ok(Outcome::Quarantine)
     }
@@ -548,7 +568,18 @@ impl Sync {
         self.pushed_before = self.pushed.clone(); // as things stood when this pass began
         self.waiting_before = self.waiting.clone();
         let mut copies = 0usize;
+        self.cut_short = false;
         for (n, a) in acts.iter().enumerate() {
+            // The daemon was told to end (a signal from the system, or `stop`): the change
+            // that was being made is finished, and no other is begun. What is left is looked
+            // at afresh by the next daemon.
+            if self.daemon
+                && (crate::signals::received().is_some() || self.home("stop.flag").exists())
+            {
+                self.cut_short = true;
+                done.deferred += acts.len() - n;
+                break;
+            }
             let key = (a.leaf.clone(), a.fid.clone());
             if a.kind != Kind::Quarantine {
                 if let Some(hook) = self.hooks.before_copy.as_mut() {

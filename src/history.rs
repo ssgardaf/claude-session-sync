@@ -206,11 +206,20 @@ impl Sync {
                 .home("undone")
                 .join(stamp)
                 .join(text(e, "leaf")?.replace('/', "_"));
-            fs::create_dir_all(&gone).map_err(e2s)?;
+            winfs::make_dirs(&gone).map_err(e2s)?;
             let base = dst
                 .file_name()
                 .ok_or_else(|| String::from("the entry names no file"))?;
-            winfs::move_file(&dst, &gone.join(base)).map_err(e2s)?;
+            // (a second undo within the same second finds the first one's file there: it is
+            // not replaced, the next free name is taken)
+            let mut kept = gone.join(base);
+            let mut n = 1;
+            while kept.exists() {
+                n += 1;
+                kept = gone.join(format!("{}.{}", base.to_string_lossy(), n));
+            }
+            winfs::move_file(&dst, &kept).map_err(e2s)?;
+            let _ = winfs::make_private(&kept);
             self.forget(&dst);
             done.removed += 1;
         } else if let Some(saved) = saved.filter(|s| s.exists()) {
@@ -407,7 +416,7 @@ impl Sync {
             }
         }
         self.save_manifest()?;
-        fs::create_dir_all(&self.p.home)?;
+        winfs::make_dirs(&self.p.home)?;
         self.journal(&[
             ("kind", json!("restore")),
             ("fid", json!(fid)),

@@ -11,9 +11,12 @@
 #
 # Nothing here needs root, and no shell profile is changed. (Windows: use install.ps1.)
 #
-# Everything is inside one function that is called on the last line, so that a download of
-# this script that was cut off runs nothing at all.
+# The whole script is one group in braces. A shell runs nothing of a group before it has
+# read its closing brace, so a download of this script that was cut off anywhere is an
+# error and runs nothing at all: not a part of it, and not the install without the options
+# it was given.
 
+{
 set -eu
 
 fail() {
@@ -97,3 +100,5 @@ main() {
 }
 
 main "$@"
+exit $?
+}

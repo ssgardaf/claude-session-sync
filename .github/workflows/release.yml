@@ -1,19 +1,23 @@
 name: release
 
 # Pushing a tag like v0.2.0 builds the programs for Windows, macOS and Linux and publishes
-# them as a release. Nothing is published unless every one of them was built and tested.
+# them as a release. Nothing is published unless every one of them was built and tested,
+# and what is tested is what is shipped: the static Linux programs themselves, and both
+# halves of the macOS one.
 on:
   push:
     tags: ["v*"]
 
+# The jobs that build only read the repository; the one that publishes is the only one that
+# may write to it.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tag matches the version in Cargo.toml
         shell: pwsh
         run: |
@@ -31,7 +35,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath claude-session-sync-windows-x64.zip
           (Get-FileHash claude-session-sync-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  claude-session-sync-windows-x64.zip" |
             Out-File -Encoding ascii claude-session-sync-windows-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-x64
           path: |
@@ -43,7 +47,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Tag matches the version in Cargo.toml
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
@@ -55,6 +59,15 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
+      # The runner is an Apple silicon machine: it runs the Intel half only through Rosetta.
+      # Where Rosetta is not installed, the Intel half is built and packed without being run.
+      - name: Test the Intel half
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            cargo test --release --locked --target x86_64-apple-darwin
+          else
+            echo "::notice::Rosetta is not installed on this runner: the Intel half was built, not run"
+          fi
       - name: Package
         run: |
           mkdir dist
@@ -65,10 +78,11 @@ jobs:
           codesign --force --sign - dist/claude-session-sync
           lipo -archs dist/claude-session-sync
           dist/claude-session-sync --version
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 dist/claude-session-sync --version; fi
           cp README.md LICENSE dist/
           COPYFILE_DISABLE=1 tar -czf claude-session-sync-macos-universal.tar.gz -C dist claude-session-sync README.md LICENSE
           shasum -a 256 claude-session-sync-macos-universal.tar.gz > claude-session-sync-macos-universal.tar.gz.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-universal
           path: |
@@ -89,7 +103,7 @@ jobs:
             asset: claude-session-sync-linux-arm64.tar.gz
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust, where the runner comes without it
         run: |
           if ! command -v cargo >/dev/null 2>&1; then
@@ -100,12 +114,13 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           [ "v$version" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} does not match Cargo.toml version $version"; exit 1; }
+      # (the static program that is shipped, not a build against this runner's C library)
       - name: Test
-        run: cargo test --release --locked
-      - name: Build
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo test --release --locked --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
           mkdir dist
@@ -113,7 +128,7 @@ jobs:
           dist/claude-session-sync --version
           tar -czf ${{ matrix.asset }} -C dist claude-session-sync README.md LICENSE
           sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
           path: |
@@ -124,8 +139,10 @@ jobs:
   publish:
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
           merge-multiple: true

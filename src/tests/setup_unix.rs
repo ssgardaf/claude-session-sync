@@ -1,11 +1,11 @@
 //! install / uninstall / pause / resume on macOS and Linux, and what `status` says of them.
 //! Nothing here touches launchd, systemd or any process: the system's tools are replaced by
-//! a recorder that keeps a little state of its own (is the agent loaded, is it disabled, does
-//! a systemd user session answer). Both ways of starting the daemon are tested on either
-//! system: which one is used is the recorder's to say.
+//! a recorder that keeps a little state of its own (is the agent loaded, is it disabled, is
+//! the unit enabled and running, does a systemd user session answer). Both ways of starting
+//! the daemon are tested on either system: which one is used is the recorder's to say.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use serde_json::json;
 
@@ -20,6 +20,7 @@ type Held = Rc<RefCell<Option<Lock>>>;
 
 const BOTH: [Manager; 2] = [Manager::Launchd, Manager::Systemd];
 const TARGET: &str = "gui/501/io.github.ssgardaf.claude-session-sync";
+const UNIT: &str = "claude-session-sync.service";
 
 /// Records what would be run. `refuse` lists beginnings of command lines that fail.
 pub(super) struct Recorder {
@@ -31,12 +32,18 @@ pub(super) struct Recorder {
     on_start: Option<Start>,
     /// What to do when the manager ends the daemon.
     on_stop: Option<Start>,
-    /// launchd has the agent loaded / systemd has the unit enabled.
-    registered: bool,
-    /// The agent or the unit is disabled (a pause).
+    /// launchd has the agent loaded.
+    loaded: bool,
+    /// launchd has the agent on record as disabled (a pause).
     disabled: bool,
     /// A user session of systemd answers.
     session: bool,
+    /// What systemd says of the unit: None = it knows of no such unit file.
+    enabled: Option<bool>,
+    /// systemd is running the unit.
+    active: bool,
+    /// What systemd says of the folders it reads units from.
+    unit_path: String,
     ours: Vec<u32>,
     asked: Vec<(u32, Option<f64>)>,
     ended: Vec<u32>,
@@ -53,9 +60,15 @@ impl Recorder {
             manager,
             on_start: None,
             on_stop: None,
-            registered: false,
+            loaded: false,
             disabled: false,
             session: true,
+            enabled: None,
+            active: false,
+            // (nothing of the user's own in it: the unit goes to ~/.config/systemd/user)
+            unit_path: String::from(
+                "/run/user/501/systemd/transient /etc/systemd/user /usr/lib/systemd/user",
+            ),
             ours: Vec::new(),
             asked: Vec::new(),
             ended: Vec::new(),
@@ -67,11 +80,13 @@ impl Recorder {
         Recorder::with(Manager::native())
     }
 
-    /// As on a computer where this tool is installed (the file that says so is `installed`'s
-    /// to make: see below).
+    /// As on a computer where this tool is installed, as far as launchd or systemd say
+    /// (the file that goes with it is `registered`'s to make: see below).
     pub(super) fn installed() -> Recorder {
         Recorder {
-            registered: true,
+            loaded: true,
+            enabled: Some(true),
+            active: true,
             ..Recorder::new()
         }
     }
@@ -85,6 +100,15 @@ impl Recorder {
             .iter()
             .position(|c| c.starts_with(what))
             .unwrap_or_else(|| panic!("never ran: {}\n{:#?}", what, self.ran))
+    }
+
+    /// Everything that was run only asked a question.
+    fn only_asked(&self) -> bool {
+        self.ran.iter().all(|c| {
+            c.starts_with("launchctl print")
+                || c.starts_with("systemctl --user show ")
+                || c.starts_with("systemctl --user is-")
+        })
     }
 
     fn started(&mut self) {
@@ -111,7 +135,7 @@ impl System for Recorder {
         let mut out = String::new();
         let code = match (program, words.as_slice()) {
             ("launchctl", ["print", _]) => {
-                if self.registered {
+                if self.loaded {
                     0
                 } else {
                     113
@@ -127,16 +151,16 @@ impl System for Recorder {
             }
             ("launchctl", ["bootstrap", _, file]) => {
                 assert!(Path::new(file).is_file(), "{}", file);
-                if self.disabled || self.registered {
+                if self.disabled || self.loaded {
                     5 // launchd's "Input/output error" for both
                 } else {
-                    self.registered = true;
+                    self.loaded = true;
                     self.started();
                     0
                 }
             }
             ("launchctl", ["bootout", _]) => {
-                if std::mem::take(&mut self.registered) {
+                if std::mem::take(&mut self.loaded) {
                     self.stopped();
                     0
                 } else {
@@ -151,36 +175,62 @@ impl System for Recorder {
                 self.disabled = true;
                 0
             }
-            ("launchctl", ["kickstart", _]) if self.registered => {
+            ("launchctl", ["kickstart", _]) if self.loaded => {
                 self.started();
                 0
             }
             ("launchctl", _) => 1,
             ("systemctl", ["--user", ..]) if !self.session => 1, // "Failed to connect to bus"
-            ("systemctl", ["--user", "show-environment"]) => 0,
-            ("systemctl", ["--user", "daemon-reload"]) => 0,
-            ("systemctl", ["--user", "is-enabled", _]) => {
-                if self.registered && !self.disabled {
+            ("systemctl", ["--user", "show", "-p", "UnitPath", "--value"]) => {
+                out = format!("{}\n", self.unit_path);
+                0
+            }
+            ("systemctl", ["--user", "daemon-reload" | "reset-failed", ..]) => 0,
+            ("systemctl", ["--user", "is-enabled", _]) => match self.enabled {
+                Some(true) => {
                     out = String::from("enabled\n");
                     0
-                } else {
+                }
+                Some(false) => {
                     out = String::from("disabled\n");
                     1
                 }
+                None => {
+                    out = String::from("not-found\n");
+                    4
+                }
+            },
+            ("systemctl", ["--user", "is-active", _]) => {
+                if self.active {
+                    out = String::from("active\n");
+                    0
+                } else {
+                    out = String::from("inactive\n");
+                    3
+                }
             }
             ("systemctl", ["--user", "enable", "--now", _]) => {
-                self.registered = true;
-                self.disabled = false;
+                self.enabled = Some(true);
+                self.active = true;
                 self.started();
                 0
             }
-            ("systemctl", ["--user", "disable", "--now", _]) => {
-                self.disabled = true;
-                self.stopped();
-                0
+            ("systemctl", ["--user", "disable", rest @ ..]) => {
+                // (a unit without its file cannot be disabled; with --now it is not stopped either)
+                if self.enabled.is_none() {
+                    1
+                } else {
+                    self.enabled = Some(false);
+                    if rest.first() == Some(&"--now") && std::mem::take(&mut self.active) {
+                        self.stopped();
+                    }
+                    0
+                }
             }
             ("systemctl", ["--user", "stop", _]) => {
-                self.stopped();
+                if std::mem::take(&mut self.active) {
+                    self.stopped();
+                }
                 0
             }
             ("systemctl", _) => 1,
@@ -260,13 +310,40 @@ fn service(b: &Base, manager: Manager) -> PathBuf {
     service_file(manager, &b.env()).unwrap()
 }
 
-/// The file an install leaves for the manager, without an install.
+fn wants(b: &Base) -> PathBuf {
+    service(b, Manager::Systemd)
+        .parent()
+        .unwrap()
+        .join("default.target.wants")
+        .join(UNIT)
+}
+
+/// The file an install leaves for the manager, and the manager having taken it up, without
+/// an install.
 fn registered(b: &Base, manager: Manager) -> Recorder {
     let file = service(b, manager);
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     fs::write(&file, b"as an install left it").unwrap();
+    if manager == Manager::Systemd {
+        fs::create_dir_all(wants(b).parent().unwrap()).unwrap();
+        let _ = fs::remove_file(wants(b));
+        std::os::unix::fs::symlink(&file, wants(b)).unwrap();
+    }
     Recorder {
-        registered: true,
+        loaded: true,
+        enabled: Some(true),
+        active: true,
+        ..Recorder::with(manager)
+    }
+}
+
+/// As `registered`, paused.
+fn paused(b: &Base, manager: Manager) -> Recorder {
+    let _ = registered(b, manager);
+    let _ = fs::remove_file(wants(b));
+    Recorder {
+        disabled: true,
+        enabled: Some(false),
         ..Recorder::with(manager)
     }
 }
@@ -286,7 +363,6 @@ fn daemon_comes_up(b: &Base, version: &'static str, started_ago: f64) -> (Start,
 
 /// Run one of the four with the recorder. What it said, and how it ended.
 fn act_in(
-    b: &Base,
     env: &Env,
     sys: &mut Recorder,
     exe: PathBuf,
@@ -320,7 +396,6 @@ fn act_in(
         "resume" => setup.resume(),
         other => panic!("{}", other),
     };
-    assert_eq!(paths.home, b.home);
     (result, said)
 }
 
@@ -330,11 +405,15 @@ fn act(
     exe: PathBuf,
     what: &str,
 ) -> (Result<(), String>, Vec<String>) {
-    act_in(b, &b.env(), sys, exe, what)
+    act_in(&b.env(), sys, exe, what)
 }
 
 fn says(said: &[String], what: &str) -> bool {
     said.iter().any(|l| l.contains(what))
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
 pub(super) fn cli(b: &Base, sys: &mut Recorder, args: &[&str]) -> (i32, Vec<String>) {
@@ -425,35 +504,78 @@ fn systemd_unit_has_what_the_daemon_relies_on() {
     }
     assert!(!text.contains("Environment="));
     assert!(text.ends_with("WantedBy=default.target\n"));
-    // what systemd would read as something else is written so that it does not
+}
+
+/// What systemd 255 was seen to do with each of these, in a unit that was really started:
+/// in the program's path `$` stands for itself (`$$` is not turned back into `$` there) and
+/// `%` has to be doubled; in a setting a quote and a backslash take a backslash, `%` is
+/// doubled and `$` stands for itself.
+#[test]
+fn systemd_unit_is_written_so_that_systemd_reads_the_paths_back_as_they_are() {
     let text = unit_text(
-        Path::new("/home/some one/100% \"mine\"/$HOME/back\\slash/claude-session-sync"),
+        Path::new("/home/some one/100% mine/dollar$x/two$$y/semi;colon/claude-session-sync"),
         "daemon --interval 60 --quick 0",
-        &[(
-            "CLAUDE_SESSION_SYNC_STORE",
-            PathBuf::from("/mnt/50% off/$x \"y\""),
-        )],
+        &[
+            (
+                "CLAUDE_SESSION_SYNC_STORE",
+                PathBuf::from("/mnt/50% off/$x \"y\" it's back\\slash"),
+            ),
+            ("XDG_CONFIG_HOME", PathBuf::from("/home/some one/cfg")),
+        ],
     );
     assert!(text.contains(
-        "ExecStart=\"/home/some one/100%% \\\"mine\\\"/$$HOME/back\\\\slash/claude-session-sync\" daemon --interval 60 --quick 0\n"
+        "ExecStart=\"/home/some one/100%% mine/dollar$x/two$$y/semi;colon/claude-session-sync\" daemon --interval 60 --quick 0\n"
     ));
-    assert!(text.contains("Environment=\"CLAUDE_SESSION_SYNC_STORE=/mnt/50%% off/$x \\\"y\\\"\"\n"));
+    assert!(text.contains(
+        "Environment=\"CLAUDE_SESSION_SYNC_STORE=/mnt/50%% off/$x \\\"y\\\" it's back\\\\slash\"\n"
+    ));
+    assert!(text.contains("Environment=\"XDG_CONFIG_HOME=/home/some one/cfg\"\n"));
+    // what systemd takes for a program's path, and what it does not, however it is written
+    for fine in [
+        "/home/someone/bin/claude-session-sync",
+        "/home/some one/bin/claude-session-sync",
+        "/home/dollar$x/100%/semi;colon/claude-session-sync",
+        "/home/\u{e9}t\u{e9}/\u{d55c}/claude-session-sync",
+    ] {
+        assert_eq!(unit_refusal(Path::new(fine)), None, "{}", fine);
+    }
+    for odd in [
+        "/home/quo\"te/claude-session-sync",
+        "/home/apo'strophe/claude-session-sync",
+        "/home/back\\slash/claude-session-sync",
+        "/home/new\nline/claude-session-sync",
+        "/home/tab\there/claude-session-sync",
+    ] {
+        let why = unit_refusal(Path::new(odd)).unwrap();
+        assert!(
+            why.contains("Nothing was installed") && why.contains("CLAUDE_SESSION_SYNC_HOME"),
+            "{}",
+            why
+        );
+    }
 }
 
 #[test]
 fn only_the_variables_that_are_set_are_carried_over_with_full_paths() {
     let b = Base::new();
-    assert!(overrides(&b.env()).is_empty());
+    for manager in BOTH {
+        assert!(overrides(&b.env(), manager).is_empty());
+    }
     let env = Env {
         home_override: Some(b.tmp.join("state")),
         claude_config_dir: Some(PathBuf::from("relative/claude")),
+        xdg_config_home: Some(b.tmp.join("xdg")),
         ..b.env()
     };
-    let found = overrides(&env);
-    assert_eq!(found.len(), 2);
+    let found = overrides(&env, Manager::Launchd);
+    assert_eq!(found.len(), 2); // (where the app's folder is does not hang on XDG_CONFIG_HOME on a Mac)
     assert_eq!(found[0], ("CLAUDE_SESSION_SYNC_HOME", b.tmp.join("state")));
     assert_eq!(found[1].0, "CLAUDE_CONFIG_DIR");
     assert!(found[1].1.is_absolute() && found[1].1.ends_with("relative/claude"));
+    // under systemd the daemon would not see the shell's XDG_CONFIG_HOME: it is handed on
+    let found = overrides(&env, Manager::Systemd);
+    assert_eq!(found.len(), 3);
+    assert_eq!(found[2], ("XDG_CONFIG_HOME", b.tmp.join("xdg")));
 }
 
 #[test]
@@ -480,48 +602,79 @@ fn a_paused_agent_is_told_from_launchds_listing() {
 }
 
 #[test]
+fn the_unit_goes_where_the_users_systemd_reads_its_units_from() {
+    // as `systemctl --user show -p UnitPath --value` answers
+    let usual = "/home/someone/.config/systemd/user.control /run/user/1000/systemd/user.control \
+                 /run/user/1000/systemd/transient /run/user/1000/systemd/generator.early \
+                 /home/someone/.config/systemd/user /etc/xdg/systemd/user /etc/systemd/user \
+                 /run/user/1000/systemd/user /run/systemd/user /home/someone/.local/share/systemd/user \
+                 /usr/local/share/systemd/user /usr/share/systemd/user /usr/lib/systemd/user\n";
+    assert_eq!(
+        unit_dir_in(usual),
+        Some(PathBuf::from("/home/someone/.config/systemd/user"))
+    );
+    // a systemd that was started with another XDG_CONFIG_HOME reads from there
+    assert_eq!(
+        unit_dir_in(&usual.replace("/home/someone/.config", "/elsewhere/cfg")),
+        Some(PathBuf::from("/elsewhere/cfg/systemd/user"))
+    );
+    assert_eq!(
+        unit_dir_in("/run/user/1000/systemd/user /etc/systemd/user"),
+        None
+    );
+    assert_eq!(unit_dir_in(""), None);
+}
+
+#[test]
 fn how_the_daemon_is_started_is_asked_of_the_system() {
     let b = Base::new();
     let env = b.env();
     for manager in BOTH {
-        // nothing installed: no file, and nothing is asked
+        // nothing installed: asked all the same (the file is not all there is to it)
         let mut sys = Recorder::with(manager);
         assert_eq!(autostart(&mut sys, &env), Autostart::NotInstalled);
-        assert!(sys.ran.is_empty());
+        assert!(!sys.ran.is_empty() && sys.only_asked());
         // installed
         let mut sys = registered(&b, manager);
         assert_eq!(autostart(&mut sys, &env), Autostart::Task { paused: false });
         // paused
-        sys.disabled = true;
-        sys.registered = manager == Manager::Systemd;
+        let mut sys = paused(&b, manager);
         assert_eq!(autostart(&mut sys, &env), Autostart::Task { paused: true });
+        // the file was deleted while the daemon runs: not "not installed"
+        let mut sys = registered(&b, manager);
         fs::remove_file(service(&b, manager)).unwrap();
+        if manager == Manager::Systemd {
+            sys.enabled = None;
+        }
+        assert_eq!(autostart(&mut sys, &env), Autostart::NoFile);
+        assert!(sys.only_asked());
+        let _ = fs::remove_file(wants(&b));
     }
     // the agent's file is there, but launchd does not have it and it is not disabled
     let mut sys = registered(&b, Manager::Launchd);
-    sys.registered = false;
+    sys.loaded = false;
     assert_eq!(autostart(&mut sys, &env), Autostart::NotLoaded);
-    assert_eq!(
-        sys.ran,
-        vec![
-            format!("launchctl print {}", TARGET),
-            String::from("launchctl print-disabled gui/501"),
-        ]
-    );
+    // the unit was disabled by hand while it runs: not as installed, and not "paused" either
+    let mut sys = registered(&b, Manager::Systemd);
+    sys.enabled = Some(false);
+    assert_eq!(autostart(&mut sys, &env), Autostart::NotLoaded);
     // the unit's file is there, but no systemd answers
     let mut sys = registered(&b, Manager::Systemd);
     sys.session = false;
     assert_eq!(autostart(&mut sys, &env), Autostart::NoManager);
-    assert_eq!(
-        sys.ran,
-        vec!["systemctl --user is-enabled claude-session-sync.service"]
-    );
+    assert_eq!(sys.ran.len(), 1);
+    // no systemd answers and nothing was ever installed
+    fs::remove_file(service(&b, Manager::Systemd)).unwrap();
+    let mut sys = Recorder::with(Manager::Systemd);
+    sys.session = false;
+    assert_eq!(autostart(&mut sys, &env), Autostart::NotInstalled);
     // every answer has a line in `status`
     for (found, word) in [
         (Autostart::Task { paused: false }, "installed ("),
         (Autostart::Task { paused: true }, "PAUSED"),
         (Autostart::NotInstalled, "not installed"),
-        (Autostart::NotLoaded, "not active"),
+        (Autostart::NotLoaded, "not in effect"),
+        (Autostart::NoFile, "its file is missing"),
         (Autostart::NoManager, "no systemd user session"),
         (Autostart::Unknown, "unknown"),
     ] {
@@ -561,18 +714,17 @@ fn install_copies_registers_starts_and_confirms() {
             ..b.env()
         };
         let exe = program(&b);
-        let (result, said) = act_in(&b, &env, &mut sys, exe, "install --delete-sync");
+        let (result, said) = act_in(&env, &mut sys, exe, "install --delete-sync");
         assert_eq!(result, Ok(()), "{:?}", manager);
-        // the program, as a program
+        // the program, as a program, and the user's alone like everything in that folder
         let installed = bin(&b).join(CONSOLE_EXE);
         assert_eq!(fs::read(&installed).unwrap(), b"the program");
-        assert_eq!(
-            fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
+        assert_eq!(mode(&installed), 0o700);
+        assert_eq!((mode(&b.home), mode(&bin(&b))), (0o700, 0o700));
         assert_eq!(listdir(&bin(&b)), vec![CONSOLE_EXE]); // nothing is left beside it
-                                                          // the definition, where the manager looks for it
+                                                          // the definition, where the manager looks for it, readable as the manager wants it
         let definition = fs::read_to_string(service(&b, manager)).unwrap();
+        assert_eq!(mode(&service(&b, manager)), 0o644);
         assert!(definition.contains(&installed.display().to_string()));
         match manager {
             Manager::Launchd => {
@@ -594,11 +746,10 @@ fn install_copies_registers_starts_and_confirms() {
                     sys.position("systemctl --user daemon-reload")
                         < sys.position("systemctl --user enable --now claude-session-sync.service")
                 );
-                assert_eq!(sys.count("systemctl --user stop"), 0);
             }
         }
-        assert!(!definition.contains("CLAUDE_")); // no variable was set
-                                                  // the link, and the settings for the next install
+        assert!(!definition.contains("CLAUDE_") && !definition.contains("XDG_")); // no variable was set
+                                                                                  // the link, and the settings for the next install
         assert_eq!(fs::read_link(link(&b)).unwrap(), installed);
         assert_eq!(
             load_settings(&b.home),
@@ -607,6 +758,7 @@ fn install_copies_registers_starts_and_confirms() {
                 ..Settings::default()
             })
         );
+        assert_eq!(mode(&b.home.join("settings.json")), 0o600);
         // what the user is told: that it worked, what was set up, where things are, what to do next
         assert!(said[0].starts_with("Installed."));
         assert!(says(
@@ -658,7 +810,7 @@ fn install_writes_the_variables_that_are_set_into_the_definition() {
             userprofile: Some(b.tmp.join("elsewhere")),
             ..b.env()
         };
-        let (result, said) = act_in(&b, &env, &mut sys, program(&b), "install");
+        let (result, said) = act_in(&env, &mut sys, program(&b), "install");
         assert_eq!(result, Ok(()), "{:?}", manager);
         assert!(bin(&b).join(CONSOLE_EXE).is_file());
         let definition = fs::read_to_string(service_file(manager, &env).unwrap()).unwrap();
@@ -699,6 +851,56 @@ fn install_writes_the_variables_that_are_set_into_the_definition() {
     }
 }
 
+/// `XDG_CONFIG_HOME` set in the shell says where the app's folder is, not where the user's
+/// systemd reads units from: the unit goes where systemd says, and the variable goes into
+/// the unit, so that the daemon looks for the store where the command line looked.
+#[test]
+fn unit_goes_where_systemd_looks_and_carries_the_shells_xdg_config_home() {
+    let b = Base::new();
+    let shells = b.tmp.join("shell-xdg");
+    let env = Env {
+        appdata: Some(shells.clone()),
+        xdg_config_home: Some(shells.clone()),
+        ..b.env()
+    };
+    let install = |sys: &mut Recorder| {
+        let (start, held) = daemon_comes_up(&b, VERSION, 0.0);
+        sys.on_start = Some(start);
+        let (result, said) = act_in(&env, sys, program(&b), "install");
+        assert_eq!(result, Ok(()));
+        drop(held);
+        said
+    };
+    // systemd reads from ~/.config (it was not started with the shell's variable)
+    let mut sys = Recorder::with(Manager::Systemd);
+    let said = install(&mut sys);
+    let usual = service(&b, Manager::Systemd);
+    let text = fs::read_to_string(&usual).unwrap();
+    assert!(text.contains(&format!(
+        "Environment=\"XDG_CONFIG_HOME={}\"\n",
+        shells.display()
+    )));
+    assert!(!shells.join("systemd").exists()); // nothing where systemd would never look
+    assert!(says(&said, "Note: XDG_CONFIG_HOME is set in this shell."));
+    // uninstall finds it there, and says what is true
+    let mut sys = registered(&b, Manager::Systemd);
+    let (result, said) = act_in(&env, &mut sys, program(&b), "uninstall");
+    assert_eq!(result, Ok(()));
+    assert!(said[0].ends_with("removed") && !says(&said, "could NOT"));
+    assert!(!usual.exists());
+    // a systemd that was started with another folder says so, and gets its unit there
+    let theirs = b.tmp.join("managers-xdg").join("systemd").join("user");
+    let mut sys = Recorder::with(Manager::Systemd);
+    sys.unit_path = format!(
+        "/run/user/501/systemd/transient {} /etc/systemd/user",
+        theirs.display()
+    );
+    install(&mut sys);
+    assert!(theirs.join(UNIT).is_file());
+    assert!(!usual.exists());
+    assert_eq!(autostart(&mut sys, &env), Autostart::Task { paused: false });
+}
+
 #[test]
 fn install_says_so_when_the_new_daemon_does_not_come_up() {
     for manager in BOTH {
@@ -707,10 +909,35 @@ fn install_says_so_when_the_new_daemon_does_not_come_up() {
         let (result, said) = act(&b, &mut sys, program(&b), "install");
         let why = result.unwrap_err();
         assert!(why.contains("did not come up"));
-        assert!(why.contains("sync.log") && why.contains("status")); // ...and where to look
+        assert!(why.contains("status")); // ...and where to look
         assert!(!says(&said, "Installed."));
         assert!(sys.slept >= 20.0); // it waited before giving up
+        match manager {
+            // the agent stays: launchd tries again at the next login
+            Manager::Launchd => assert!(why.contains("sync.log (not written yet)")),
+            // a unit that does not start is not left enabled, to be tried once a minute for ever
+            Manager::Systemd => {
+                assert!(why.contains("systemctl --user status claude-session-sync"));
+                assert!(!why.contains("sync.log")); // (there is none to point to)
+                assert!(why.contains("taken out again"));
+                assert!(!service(&b, manager).exists());
+                assert_eq!((sys.enabled, sys.active), (Some(false), false));
+                assert!(
+                    sys.position("systemctl --user enable --now")
+                        < sys.position("systemctl --user disable")
+                );
+            }
+        }
     }
+    // an update that does not come up: the unit that was there is put back, not enabled
+    let b = Base::new();
+    let mut sys = registered(&b, Manager::Systemd);
+    assert!(act(&b, &mut sys, program(&b), "install").0.is_err());
+    assert_eq!(
+        fs::read(service(&b, Manager::Systemd)).unwrap(),
+        b"as an install left it"
+    );
+    assert_eq!((sys.enabled, sys.active), (Some(false), false));
 }
 
 #[test]
@@ -780,17 +1007,50 @@ fn install_stops_a_running_daemon_first_and_does_not_copy_onto_itself() {
     }
 }
 
+/// The agent's file was deleted while launchd has the agent loaded: launchd is asked, not
+/// the file, so the old agent is let go of before the new one is handed over (handing it
+/// over on top of the old one is refused), and the first install works.
+#[test]
+fn install_lets_go_of_an_agent_that_is_loaded_without_its_file() {
+    let b = Base::new();
+    let mut sys = Recorder::with(Manager::Launchd);
+    sys.loaded = true; // ...and no file
+    let (start, held) = daemon_comes_up(&b, VERSION, 0.0);
+    sys.on_start = Some(start);
+    let (result, said) = act(&b, &mut sys, program(&b), "install");
+    assert_eq!(result, Ok(()));
+    assert!(sys.position("launchctl bootout") < sys.position("launchctl bootstrap"));
+    assert_eq!(sys.count("launchctl bootstrap"), 1); // taken at the first try
+    assert!(said[0].starts_with("Installed."));
+    drop(held);
+    // meanwhile `status` did not call it "not installed", and `pause` did not refuse
+    let b = Base::new();
+    let mut sys = Recorder::with(Manager::Launchd);
+    sys.loaded = true;
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(
+        out[1].contains("is active, but its file is missing"),
+        "{}",
+        out[1]
+    );
+    let (result, said) = act(&b, &mut sys, program(&b), "pause");
+    assert_eq!(result, Ok(()));
+    assert!(said[0].starts_with("Paused."));
+    assert!(sys.disabled && !sys.loaded);
+    // ...but it cannot be resumed without its file, and that is said
+    let why = act(&b, &mut sys, program(&b), "resume").0.unwrap_err();
+    assert!(why.contains("not installed"), "{}", why);
+}
+
 #[test]
 fn install_lifts_a_pause_that_was_left_behind() {
     let b = Base::new();
-    let mut sys = registered(&b, Manager::Launchd);
-    sys.registered = false;
-    sys.disabled = true; // paused, and now installed again (an update)
+    let mut sys = paused(&b, Manager::Launchd);
     let (start, held) = daemon_comes_up(&b, VERSION, 0.0);
     sys.on_start = Some(start);
     assert_eq!(act(&b, &mut sys, program(&b), "install").0, Ok(()));
     assert!(sys.position("launchctl enable") < sys.position("launchctl bootstrap"));
-    assert!(!sys.disabled && sys.registered);
+    assert!(!sys.disabled && sys.loaded);
     drop(held);
 }
 
@@ -813,25 +1073,61 @@ fn install_replaces_the_program_in_one_step() {
     drop(held);
 }
 
+/// Where nothing can start the daemon by itself the program is put in place all the same:
+/// that is a success with a warning, not a failure, and it is remembered for `status`.
 #[test]
 fn install_where_no_systemd_answers_puts_the_program_in_place_and_says_how_to_run_it() {
     let b = Base::new();
     let mut sys = Recorder::with(Manager::Systemd);
     sys.session = false;
     let (result, said) = act(&b, &mut sys, program(&b), "install --delete-sync");
-    let why = result.unwrap_err();
-    assert!(why.contains("no systemd"), "{}", why);
-    assert!(why.contains("the program is in place"));
-    assert!(why.contains(" daemon --interval 3600 --quick 10 --delete-sync\n"));
-    assert!(why.contains(" sync"));
-    assert!(said.is_empty());
+    assert_eq!(result, Ok(()));
+    assert!(said[0].starts_with("Installed, but NOT to start by itself"));
+    assert!(says(&said, "no systemd user session"));
+    assert!(says(
+        &said,
+        " daemon --interval 3600 --quick 10 --delete-sync"
+    ));
+    assert!(says(&said, " sync"));
+    assert!(!says(&said, "is running now"));
     // the program, its link and the settings are there; a unit nobody would read is not
     assert!(bin(&b).join(CONSOLE_EXE).is_file());
     assert_eq!(fs::read_link(link(&b)).unwrap(), bin(&b).join(CONSOLE_EXE));
     assert!(load_settings(&b.home).is_some_and(|s| s.delete_sync));
     assert!(!service(&b, Manager::Systemd).exists());
-    assert_eq!(sys.ran, vec!["systemctl --user show-environment"]);
+    assert_eq!(sys.ran, vec!["systemctl --user show -p UnitPath --value"]);
     assert_eq!(sys.slept, 0.0); // nothing was waited for
+                                // `status` says so too, and how to run it; `pause` and `resume` have nothing to act on
+    let mut sys = Recorder::with(Manager::Systemd);
+    sys.session = false;
+    let (code, out) = cli(&b, &mut sys, &["status"]);
+    assert_eq!(code, 1);
+    assert!(out[0].starts_with("NOT RUNNING"));
+    assert_eq!(
+        out[1],
+        "autostart: not available here (no systemd user session); the daemon runs only while you run it: claude-session-sync daemon"
+    );
+    for what in ["pause", "resume"] {
+        let why = act(&b, &mut sys, program(&b), what).0.unwrap_err();
+        assert!(why.contains("no systemd user session"), "{}", why);
+    }
+    // once a session is there, an install is an ordinary one, and the note is gone
+    let mut sys = Recorder::with(Manager::Systemd);
+    let (start, held) = daemon_comes_up(&b, VERSION, 0.0);
+    sys.on_start = Some(start);
+    assert_eq!(act(&b, &mut sys, program(&b), "install").0, Ok(()));
+    assert!(!b.home.join(NO_AUTOSTART_FILE).exists());
+    drop(held);
+    // and an uninstall where none is leaves no note behind either
+    let b = Base::new();
+    let mut sys = Recorder::with(Manager::Systemd);
+    sys.session = false;
+    assert_eq!(act(&b, &mut sys, program(&b), "install").0, Ok(()));
+    assert!(b.home.join(NO_AUTOSTART_FILE).exists());
+    assert_eq!(act(&b, &mut sys, program(&b), "uninstall").0, Ok(()));
+    assert!(!b.home.join(NO_AUTOSTART_FILE).exists());
+    let (_, out) = cli(&b, &mut sys, &["status"]);
+    assert!(out[1].starts_with("autostart: not installed"));
 }
 
 #[test]
@@ -844,6 +1140,7 @@ fn install_says_so_when_the_manager_does_not_take_the_definition() {
     assert!(why.contains("loaded at your next login"));
     assert_eq!(sys.count("launchctl bootstrap"), 8); // (launchd may be busy with the agent before: asked again)
     assert!(service(&b, Manager::Launchd).is_file());
+    // systemd: nothing that was refused is left enabled, or left at all
     let b = Base::new();
     let mut sys = Recorder::with(Manager::Systemd);
     sys.refuse.push("systemctl --user enable");
@@ -853,7 +1150,77 @@ fn install_says_so_when_the_manager_does_not_take_the_definition() {
         "{}",
         why
     );
-    assert!(why.contains("systemctl --user status claude-session-sync.service"));
+    assert!(why.contains("systemctl --user status claude-session-sync"));
+    assert!(why.contains("taken out again"));
+    assert!(!service(&b, Manager::Systemd).exists());
+    assert_eq!(sys.slept, 0.0); // (no waiting for a daemon that was never started)
+}
+
+/// A folder systemd cannot start a program from is said before anything is written: no
+/// program, no unit, no link, nothing asked of systemd but where it reads its units.
+#[test]
+fn install_refuses_up_front_a_path_systemd_cannot_start() {
+    for odd in ["quo\"te", "apo'strophe", "back\\slash"] {
+        let b = Base::new();
+        let state = b.tmp.join(odd).join("state");
+        let env = Env {
+            home_override: Some(state.clone()),
+            ..b.env()
+        };
+        let before = b.snapshot(&b.tmp);
+        let mut sys = Recorder::with(Manager::Systemd);
+        let (result, said) = act_in(&env, &mut sys, program(&b), "install");
+        let why = result.unwrap_err();
+        assert!(why.contains("systemd cannot start a program whose path has"));
+        assert!(why.contains("Nothing was installed") && why.contains(odd));
+        assert!(said.is_empty() && sys.ran.is_empty());
+        let mut after = b.snapshot(&b.tmp);
+        after.retain(|path, _| !path.starts_with(b.tmp.join("download")));
+        assert_eq!(before, after);
+        assert!(!state.exists());
+        // launchd takes such a path as it is
+        let mut sys = Recorder::with(Manager::Launchd);
+        let held: Held = Rc::new(RefCell::new(None));
+        let (slot, home) = (held.clone(), state.clone());
+        sys.on_start = Some(Box::new(move || {
+            *slot.borrow_mut() = acquire_lock(&home).unwrap();
+            let st = json!({"pid": 4242, "version": VERSION, "started": now() as i64, "heartbeat": now() as i64});
+            fs::write(home.join("status.json"), st.to_string()).unwrap();
+        }));
+        assert_eq!(
+            act_in(&env, &mut sys, program(&b), "install").0,
+            Ok(()),
+            "{}",
+            odd
+        );
+        drop(held);
+    }
+    // what systemd does take is written as it takes it
+    let b = Base::new();
+    let state = b.tmp.join("dollar$x 100%").join("state");
+    let env = Env {
+        home_override: Some(state.clone()),
+        ..b.env()
+    };
+    let mut sys = Recorder::with(Manager::Systemd);
+    let held: Held = Rc::new(RefCell::new(None));
+    let (slot, home) = (held.clone(), state.clone());
+    sys.on_start = Some(Box::new(move || {
+        *slot.borrow_mut() = acquire_lock(&home).unwrap();
+        let st = json!({"pid": 4242, "version": VERSION, "started": now() as i64, "heartbeat": now() as i64});
+        fs::write(home.join("status.json"), st.to_string()).unwrap();
+    }));
+    assert_eq!(act_in(&env, &mut sys, program(&b), "install").0, Ok(()));
+    let text = fs::read_to_string(service(&b, Manager::Systemd)).unwrap();
+    assert!(
+        text.contains(&format!(
+            "ExecStart=\"{}/dollar$x 100%%/state/bin/claude-session-sync\" daemon",
+            b.tmp.display()
+        )),
+        "{}",
+        text
+    );
+    drop(held);
 }
 
 #[test]
@@ -958,6 +1325,77 @@ fn install_keeps_the_settings_of_the_install_before() {
     }
 }
 
+/// What an earlier version left readable by everyone becomes the user's alone at the next
+/// install (and when the daemon starts: the same call); what is not this tool's is left.
+#[test]
+fn an_install_made_by_an_earlier_version_is_tightened() {
+    let b = Base::new();
+    let open = |path: &Path, as_dir: bool| {
+        if as_dir {
+            fs::create_dir_all(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        } else {
+            fs::write(path, b"x").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    };
+    open(&b.home, true);
+    let kept = b.home.join("replaced").join("20260101").join("a_b");
+    let dirs = [
+        b.home.join("backups"),
+        b.home.join("quarantine").join("a_b"),
+        kept.clone(),
+        b.home.join("undone"),
+        bin(&b),
+    ];
+    for dir in &dirs {
+        open(dir, true);
+    }
+    let files = [
+        b.home.join("sync.log"),
+        b.home.join("journal.jsonl"),
+        b.home.join("manifest.json"),
+        b.home.join("state.json"),
+        b.home.join("status.json"),
+        b.home.join("settings.json"),
+        b.home.join("backups").join("20260101-000000.zip"),
+        b.home.join("quarantine").join("a_b").join("local_x.json.1"),
+        kept.join("local_x.json.1"),
+    ];
+    for file in &files {
+        open(file, false);
+    }
+    let installed = bin(&b).join(CONSOLE_EXE);
+    fs::write(&installed, b"the program").unwrap();
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+    // not this tool's: a file of the user's own, and a link out of the folder
+    let own = b.home.join("notes of my own.txt");
+    open(&own, false);
+    let outside = b.tmp.join("outside.txt");
+    open(&outside, false);
+    std::os::unix::fs::symlink(&outside, b.home.join("backups").join("a link")).unwrap();
+    tighten(&b.home);
+    assert_eq!(mode(&b.home), 0o700);
+    for dir in &dirs {
+        assert_eq!(mode(dir), 0o700, "{}", dir.display());
+    }
+    assert_eq!(mode(&b.home.join("replaced")), 0o700);
+    assert_eq!(mode(&b.home.join("replaced").join("20260101")), 0o700);
+    for file in &files {
+        assert_eq!(mode(file), 0o600, "{}", file.display());
+    }
+    assert_eq!(mode(&installed), 0o700); // still a program
+    assert_eq!((mode(&own), mode(&outside)), (0o644, 0o644));
+    // a folder that is not there, or is a link to one, is left be
+    tighten(&b.tmp.join("no such folder"));
+    let linked = b.tmp.join("linked-home");
+    std::os::unix::fs::symlink(b.tmp.join("download"), &linked).unwrap();
+    fs::create_dir_all(b.tmp.join("download")).unwrap();
+    fs::set_permissions(b.tmp.join("download"), fs::Permissions::from_mode(0o755)).unwrap();
+    tighten(&linked);
+    assert_eq!(mode(&b.tmp.join("download")), 0o755);
+}
+
 // ---------------------------------------------------------------------- uninstall
 
 #[test]
@@ -982,17 +1420,26 @@ fn uninstall_removes_the_autostart_before_stopping_the_daemon() {
                     format!("launchctl print {}", TARGET),
                     format!("launchctl bootout {}", TARGET),
                     format!("launchctl print {}", TARGET),
-                    format!("launchctl print {}", TARGET),
                     String::from("launchctl print-disabled gui/501"),
                 ]
             ),
-            Manager::Systemd => assert_eq!(
-                sys.ran,
-                vec![
-                    "systemctl --user disable --now claude-session-sync.service",
-                    "systemctl --user daemon-reload",
-                ]
-            ),
+            Manager::Systemd => {
+                assert!(
+                    sys.position("systemctl --user stop claude-session-sync.service")
+                        < sys.position("systemctl --user disable claude-session-sync.service")
+                );
+                assert_eq!(sys.count("systemctl --user daemon-reload"), 1);
+                // ...and systemd was asked afterwards whether it is really stopped
+                assert_eq!(
+                    sys.ran.last().unwrap(),
+                    "systemctl --user is-active claude-session-sync.service"
+                );
+                assert!(fs::symlink_metadata(wants(&b)).is_err());
+            }
+        }
+        match manager {
+            Manager::Launchd => assert!(!sys.loaded),
+            Manager::Systemd => assert!(!sys.active && sys.enabled == Some(false)),
         }
         assert!(!service(&b, manager).exists());
         // only our link leaves that folder
@@ -1023,12 +1470,55 @@ fn uninstall_removes_the_autostart_before_stopping_the_daemon() {
     }
 }
 
+/// The unit's file was deleted while systemd runs the unit. systemd still has it, would
+/// start the daemon again a minute after it was stopped, and its link for the enabled unit
+/// is left pointing at nothing: none of that is "was not installed".
+#[test]
+fn uninstall_takes_a_daemon_away_from_the_manager_whatever_files_are_left() {
+    let b = Base::new();
+    let mut sys = registered(&b, Manager::Systemd);
+    fs::remove_file(service(&b, Manager::Systemd)).unwrap();
+    sys.enabled = None;
+    let running: Held = Rc::new(RefCell::new(acquire_lock(&b.home).unwrap()));
+    let slot = running.clone();
+    sys.on_stop = Some(Box::new(move || drop(slot.borrow_mut().take())));
+    let (result, said) = act(&b, &mut sys, program(&b), "uninstall");
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        sys.count("systemctl --user stop claude-session-sync.service"),
+        1
+    );
+    assert!(!sys.active && running.borrow().is_none());
+    assert!(fs::symlink_metadata(wants(&b)).is_err()); // the dangling link is gone too
+    assert!(said[0].ends_with("removed"), "{}", said[0]);
+    assert!(says(&said, "not running any more"));
+    // systemd would not let go: that is said, and where to look
+    let b = Base::new();
+    let mut sys = registered(&b, Manager::Systemd);
+    sys.refuse.push("systemctl --user stop");
+    let (result, said) = act(&b, &mut sys, program(&b), "uninstall");
+    assert_eq!(result, Ok(()));
+    assert!(sys.active);
+    assert!(
+        said[0].contains("could NOT be removed")
+            && said[0].contains("systemctl --user status claude-session-sync"),
+        "{}",
+        said[0]
+    );
+    // the same for an agent that is loaded without its file
+    let b = Base::new();
+    let mut sys = Recorder::with(Manager::Launchd);
+    sys.loaded = true;
+    let (result, said) = act(&b, &mut sys, program(&b), "uninstall");
+    assert_eq!(result, Ok(()));
+    assert!(!sys.loaded);
+    assert!(said[0].ends_with("removed"), "{}", said[0]);
+}
+
 #[test]
 fn uninstall_of_a_paused_agent_does_not_leave_the_pause_behind() {
     let b = Base::new();
-    let mut sys = registered(&b, Manager::Launchd);
-    sys.registered = false;
-    sys.disabled = true;
+    let mut sys = paused(&b, Manager::Launchd);
     let (result, said) = act(&b, &mut sys, program(&b), "uninstall");
     assert_eq!(result, Ok(()));
     assert!(!sys.disabled); // launchd keeps a pause by name: an agent installed later would stay off
@@ -1045,10 +1535,7 @@ fn uninstall_of_what_is_not_installed_changes_nothing() {
         let before = b.snapshot(&b.tmp);
         let (result, said) = act(&b, &mut sys, program(&b), "uninstall");
         assert_eq!(result, Ok(()));
-        assert_eq!(
-            sys.count("bootout") + sys.count("disable") + sys.count("enable"),
-            0
-        );
+        assert!(sys.only_asked(), "{:?}", sys.ran);
         assert!(said[0].ends_with("was not installed"), "{}", said[0]);
         // (the folder for the stop flag, and the stand-in for the download, are all that is new)
         let mut after = b.snapshot(&b.tmp);
@@ -1115,6 +1602,7 @@ fn purge_deletes_this_tools_own_files_and_nothing_else() {
         fs::create_dir_all(bin(&b)).unwrap();
         fs::write(bin(&b).join(CONSOLE_EXE), b"x").unwrap();
         fs::write(bin(&b).join(format!(".{}.new", CONSOLE_EXE)), b"x").unwrap(); // an install cut short
+        fs::write(b.home.join(NO_AUTOSTART_FILE), b"x").unwrap();
         fs::create_dir_all(link(&b).parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(bin(&b).join(CONSOLE_EXE), link(&b)).unwrap();
         for made in [
@@ -1178,34 +1666,35 @@ fn pause_disables_the_autostart_before_it_stops_the_daemon() {
         let (result, said) = act(&b, &mut sys, program(&b), "pause");
         assert_eq!(result, Ok(()), "{:?}", manager);
         match manager {
-            Manager::Launchd => assert_eq!(
-                sys.ran,
-                vec![
-                    format!("launchctl print {}", TARGET),
-                    format!("launchctl disable {}", TARGET),
-                    format!("launchctl bootout {}", TARGET),
-                ]
-            ),
-            Manager::Systemd => assert_eq!(
-                sys.ran,
-                vec![
-                    "systemctl --user is-enabled claude-session-sync.service",
-                    "systemctl --user disable --now claude-session-sync.service",
-                ]
-            ),
+            Manager::Launchd => {
+                assert!(sys.position("launchctl disable") < sys.position("launchctl bootout"));
+                assert!(sys.disabled && !sys.loaded);
+            }
+            Manager::Systemd => {
+                assert_eq!(
+                    sys.count("systemctl --user disable --now claude-session-sync.service"),
+                    1
+                );
+                assert_eq!((sys.enabled, sys.active), (Some(false), false));
+                // ...and systemd was asked afterwards whether it is really stopped
+                assert_eq!(
+                    sys.ran.last().unwrap(),
+                    "systemctl --user is-active claude-session-sync.service"
+                );
+            }
         }
-        assert!(sys.disabled);
         assert!(service(&b, manager).is_file()); // the definition stays: resume needs it
         assert!(said[0].starts_with("Paused."));
         assert!(says(&said, "claude-session-sync resume"));
         assert!(!b.home.join("stop.flag").exists()); // asked to stop, and (no daemon here) seen stopped
                                                      // pausing again is harmless
-        let before = sys.ran.len();
         let (result, said) = act(&b, &mut sys, program(&b), "pause");
         assert_eq!(result, Ok(()));
         assert!(says(&said, "paused already"));
-        assert_eq!(sys.count(" disable "), 1);
-        assert!(sys.ran.len() > before);
+        assert_eq!(
+            sys.count("launchctl disable"),
+            usize::from(manager == Manager::Launchd)
+        );
         // a daemon that will not stop is said, not hidden
         let stuck = acquire_lock(&b.home).unwrap().unwrap();
         fs::write(
@@ -1225,6 +1714,41 @@ fn pause_disables_the_autostart_before_it_stops_the_daemon() {
     }
 }
 
+/// The unit was disabled by hand while systemd runs it. It reads as disabled, but systemd
+/// would start the daemon again a minute after it was stopped: "paused already" would be a
+/// lie. The unit is stopped through systemd, and only then is it said to be paused.
+#[test]
+fn pause_does_not_take_a_unit_that_is_disabled_but_running_for_paused() {
+    let b = Base::new();
+    let mut sys = registered(&b, Manager::Systemd);
+    sys.enabled = Some(false);
+    let running: Held = Rc::new(RefCell::new(acquire_lock(&b.home).unwrap()));
+    let slot = running.clone();
+    sys.on_stop = Some(Box::new(move || drop(slot.borrow_mut().take())));
+    let (result, said) = act(&b, &mut sys, program(&b), "pause");
+    assert_eq!(result, Ok(()));
+    assert!(!says(&said, "paused already"));
+    assert!(said[0].starts_with("Paused."));
+    assert!(!sys.active && running.borrow().is_none());
+    // systemd would not stop it: nothing is said to be paused
+    let b = Base::new();
+    let mut sys = registered(&b, Manager::Systemd);
+    sys.enabled = Some(false);
+    sys.refuse.push("systemctl --user disable");
+    sys.refuse.push("systemctl --user stop");
+    let (result, said) = act(&b, &mut sys, program(&b), "pause");
+    assert!(result.unwrap_err().contains("could not be disabled"));
+    assert!(said.is_empty() && sys.active);
+    // a unit that runs without its file cannot be disabled, but is stopped all the same
+    let b = Base::new();
+    let mut sys = registered(&b, Manager::Systemd);
+    fs::remove_file(service(&b, Manager::Systemd)).unwrap();
+    sys.enabled = None;
+    let (result, said) = act(&b, &mut sys, program(&b), "pause");
+    assert_eq!(result, Ok(()));
+    assert!(said[0].starts_with("Paused.") && !sys.active);
+}
+
 #[test]
 fn pause_and_resume_say_so_when_nothing_is_installed() {
     for manager in BOTH {
@@ -1233,7 +1757,7 @@ fn pause_and_resume_say_so_when_nothing_is_installed() {
             let mut sys = Recorder::with(manager);
             let (result, said) = act(&b, &mut sys, program(&b), what);
             assert!(result.unwrap_err().contains("not installed"), "{}", what);
-            assert!(said.is_empty() && sys.ran.is_empty());
+            assert!(said.is_empty() && sys.only_asked());
         }
         let mut sys = registered(&b, manager);
         sys.refuse.push(match manager {
@@ -1244,7 +1768,7 @@ fn pause_and_resume_say_so_when_nothing_is_installed() {
             .0
             .unwrap_err()
             .contains("could not be disabled"));
-        assert!(!b.home.join("stop.flag").exists()); // nothing was changed: the daemon was not stopped either
+        assert!(!b.home.join("stop.flag").exists()); // nothing else was changed: the daemon was not stopped either
         assert_eq!(sys.count("bootout"), 0);
     }
     // where no systemd answers there is nothing to pause or resume
@@ -1261,56 +1785,43 @@ fn pause_and_resume_say_so_when_nothing_is_installed() {
 fn resume_enables_the_autostart_and_starts_the_daemon() {
     for manager in BOTH {
         let b = Base::new();
-        let mut sys = registered(&b, manager);
-        sys.disabled = true;
-        sys.registered = manager == Manager::Systemd;
+        let mut sys = paused(&b, manager);
         let (start, held) = daemon_comes_up(&b, VERSION, 0.0);
         sys.on_start = Some(start);
         let (result, said) = act(&b, &mut sys, program(&b), "resume");
         assert_eq!(result, Ok(()), "{:?}", manager);
         match manager {
-            Manager::Launchd => assert_eq!(
-                sys.ran,
-                vec![
-                    format!("launchctl print {}", TARGET),
-                    String::from("launchctl print-disabled gui/501"),
-                    format!("launchctl enable {}", TARGET),
-                    format!("launchctl print {}", TARGET),
-                    format!(
-                        "launchctl bootstrap gui/501 {}",
-                        service(&b, manager).display()
-                    ),
-                ]
-            ),
-            Manager::Systemd => assert_eq!(
-                sys.ran,
-                vec![
-                    "systemctl --user is-enabled claude-session-sync.service",
-                    "systemctl --user enable --now claude-session-sync.service",
-                ]
-            ),
+            Manager::Launchd => {
+                assert!(sys.position("launchctl enable") < sys.position("launchctl bootstrap"));
+                assert!(!sys.disabled && sys.loaded);
+            }
+            Manager::Systemd => {
+                assert_eq!(
+                    sys.ran.last().unwrap(),
+                    "systemctl --user enable --now claude-session-sync.service"
+                );
+                assert_eq!((sys.enabled, sys.active), (Some(true), true));
+            }
         }
-        assert!(!sys.disabled && sys.registered);
         assert_eq!(
             said,
             vec!["Resumed. The daemon is running again (pid 4242)."]
         );
         // resumed already, and running: said, and nothing more is done
-        let before = sys.ran.len();
         let (result, said) = act(&b, &mut sys, program(&b), "resume");
         assert_eq!(result, Ok(()));
         assert_eq!(said, vec!["Not paused: the daemon is running."]);
         assert_eq!(sys.count(" enable "), 1);
-        assert!(sys.ran.len() > before);
         drop(held);
         // enabled, but nothing came up: said so
         let b = Base::new();
-        let mut sys = registered(&b, manager);
-        sys.disabled = true;
-        sys.registered = manager == Manager::Systemd;
+        let mut sys = paused(&b, manager);
         let (result, _) = act(&b, &mut sys, program(&b), "resume");
         assert!(result.unwrap_err().contains("has not come up yet"));
-        assert!(!sys.disabled);
+        match manager {
+            Manager::Launchd => assert!(!sys.disabled),
+            Manager::Systemd => assert_eq!(sys.enabled, Some(true)),
+        }
     }
 }
 
@@ -1366,8 +1877,8 @@ fn status_begins_with_a_one_line_summary() {
         );
         assert_eq!(out[2], "");
         assert_eq!(out[3], "daemon: NOT running"); // the details follow as before
-        assert!(sys.ran.is_empty()); // nothing was asked of the system, nothing was changed
-                                     // installed and running
+        assert!(sys.only_asked()); // questions were asked of the system, nothing was changed
+                                   // installed and running
         let held = acquire_lock(&b.home).unwrap().unwrap();
         let st = json!({"pid": 4242, "version": VERSION, "started": now() as i64, "heartbeat": now() as i64});
         fs::write(b.home.join("status.json"), st.to_string()).unwrap();
@@ -1383,12 +1894,10 @@ fn status_begins_with_a_one_line_summary() {
         );
         assert_eq!(out[1], format!("autostart: installed ({})", manager.what()));
         assert!(out[3].starts_with("daemon: running (pid 4242"));
-        assert_eq!(sys.ran.len(), 1); // one question was asked, nothing was changed
+        assert!(sys.only_asked());
         drop(held);
         // paused
-        let mut sys = registered(&b, manager);
-        sys.disabled = true;
-        sys.registered = manager == Manager::Systemd;
+        let mut sys = paused(&b, manager);
         let (code, out) = cli(&b, &mut sys, &["status"]);
         assert_eq!(code, 1);
         assert!(
@@ -1399,10 +1908,7 @@ fn status_begins_with_a_one_line_summary() {
             out[0]
         );
         assert!(out[1].starts_with("autostart: installed, PAUSED"));
-        assert!(sys
-            .ran
-            .iter()
-            .all(|c| c.contains(" print") || c.contains(" is-enabled ")));
+        assert!(sys.only_asked());
     }
 }
 

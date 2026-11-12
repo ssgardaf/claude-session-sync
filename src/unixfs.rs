@@ -1,16 +1,20 @@
 //! What `winfs` needs from the system on macOS and Linux, under the names it has on Windows.
 
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use super::{on_calendar, Fields, Stat};
 
-/// The mode of every file this tool writes: what the app gives its own records.
-const FILE_MODE: u32 = 0o644;
+/// The mode of every file this tool writes, its own and the records it puts in the store:
+/// the user's alone. Session titles and paths are in them, and they are nobody else's to
+/// read; the app itself writes its records so.
+pub const FILE_MODE: u32 = 0o600;
+/// The mode of every folder this tool makes.
+pub const DIR_MODE: u32 = 0o700;
 
 pub(super) fn from_metadata(md: &fs::Metadata) -> Stat {
     Stat {
@@ -24,26 +28,70 @@ pub(super) fn from_metadata(md: &fs::Metadata) -> Stat {
             .saturating_add(md.atime_nsec()),
         size: md.size(),
         is_dir: md.is_dir(),
+        is_file: md.is_file(),
     }
 }
 
 /// Open for reading. Nothing the app does to the file is refused because of that: here an
 /// open file can be written, renamed over and deleted.
+///
+/// Only an ordinary file is opened. A pipe that nobody writes to would hold the open for
+/// ever, and a device may have no end to read to; so the open does not wait (`O_NONBLOCK`,
+/// which means nothing for an ordinary file), and what was opened is looked at before a
+/// byte is read: anything else is an error.
 pub fn open_shared(path: &Path) -> io::Result<File> {
-    File::open(path)
+    let fh = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    if !fh.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not an ordinary file: not read",
+        ));
+    }
+    Ok(fh)
 }
 
-/// A new, empty file for writing, readable by all and writable by its owner whatever the
-/// process's umask is (whatever was there is emptied).
-pub(super) fn create(path: &Path) -> io::Result<File> {
-    let fh = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(FILE_MODE)
-        .open(path)?;
-    fh.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
+/// Open one of this tool's own files, or a file it puts in the store, with the options
+/// given. A file that is made by that is the user's alone (mode 0600), whatever the
+/// process's umask, and one that was there with a wider mode is narrowed.
+pub fn open_own(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    let fh = options.mode(FILE_MODE).open(path)?;
+    if fh.metadata()?.mode() & 0o7777 != FILE_MODE {
+        fh.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
+    }
     Ok(fh)
+}
+
+/// Make a folder of this tool's own, and the folders above it that are missing. The folders
+/// made are the user's alone (mode 0700); one that is there already is left as it is.
+pub fn make_dirs(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(path)?;
+    // (whatever the umask took away or left)
+    fs::set_permissions(path, fs::Permissions::from_mode(DIR_MODE))
+}
+
+/// Make a file or folder that was moved into this tool's own folders the user's alone.
+pub fn make_private(path: &Path) -> io::Result<()> {
+    let found = fs::symlink_metadata(path)?;
+    let mode = if found.is_dir() {
+        DIR_MODE
+    } else if found.is_file() {
+        FILE_MODE | (found.mode() & 0o100) // (a program stays a program)
+    } else {
+        return Ok(()); // a link or something else: not ours to change
+    };
+    if found.mode() & 0o7777 != mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 fn c_path(path: &Path) -> io::Result<CString> {
@@ -212,21 +260,136 @@ mod tests {
         dir
     }
 
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    fn fifo(path: &Path) {
+        let c = c_path(path).unwrap();
+        // SAFETY: a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
     #[test]
-    fn what_is_written_is_readable_by_all_whatever_the_umask() {
+    fn what_is_written_is_the_users_alone_whatever_the_umask() {
+        use super::super::{append_file, create_file, create_new_file, write_file};
         let dir = scratch("mode");
         let p = dir.join("local_x.json");
         // (the umask is the process's, and other tests write files meanwhile: it is not
-        // changed here; the file's mode is set after it is made, which is what is checked)
+        // changed here. The mode asked for at creation is 0600, which no umask widens, and
+        // it is set again on the open file, which no umask narrows. The programs are run
+        // under several umasks in tests/processes.rs.)
         atomic_write(&p, b"{}", None, false, Expect::Absent).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().mode() & 0o7777, 0o644);
+        assert_eq!(mode(&p), 0o600);
         // also when a file made with another mode is in the way of the temp file
         let tmp = dir.join(".sync-local_x.json.tmp");
         fs::write(&tmp, b"left over").unwrap();
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
         atomic_write(&p, b"{\"a\":1}", None, false, Expect::Any).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().mode() & 0o7777, 0o644);
+        assert_eq!(mode(&p), 0o600);
         assert!(!tmp.exists());
+        // a record the app left readable by all is the user's alone once it is replaced
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let st = stat(&p).unwrap();
+        atomic_write(
+            &p,
+            b"{\"a\":2}",
+            None,
+            false,
+            Expect::Is(st.mtime_ns, st.size),
+        )
+        .unwrap();
+        assert_eq!(mode(&p), 0o600);
+        // every way a file of this tool's own is made
+        let made = dir.join("made");
+        drop(create_file(&made).unwrap());
+        let new = dir.join("new");
+        drop(create_new_file(&new).unwrap());
+        assert_eq!(
+            create_new_file(&new).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let log = dir.join("log");
+        drop(append_file(&log).unwrap());
+        let small = dir.join("small");
+        write_file(&small, b"x").unwrap();
+        for file in [&made, &new, &log, &small] {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
+        // one that an earlier version left readable by all is narrowed when it is next written
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(append_file(&log).unwrap());
+        assert_eq!(mode(&log), 0o600);
+        // folders: the ones made are the user's alone, one that was there is left as it is
+        let deep = dir.join("a").join("b").join("c");
+        make_dirs(&deep).unwrap();
+        for folder in [&deep, &dir.join("a").join("b"), &dir.join("a")] {
+            assert_eq!(mode(folder), 0o700, "{}", folder.display());
+        }
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o755)).unwrap();
+        make_dirs(&deep).unwrap();
+        assert_eq!(mode(&deep), 0o755);
+        // what was moved in from elsewhere: a file 0600, a program still a program, a link left
+        let moved = dir.join("moved");
+        fs::write(&moved, b"x").unwrap();
+        fs::set_permissions(&moved, fs::Permissions::from_mode(0o664)).unwrap();
+        make_private(&moved).unwrap();
+        assert_eq!(mode(&moved), 0o600);
+        fs::set_permissions(&moved, fs::Permissions::from_mode(0o755)).unwrap();
+        make_private(&moved).unwrap();
+        assert_eq!(mode(&moved), 0o700);
+        make_private(&deep).unwrap();
+        assert_eq!(mode(&deep), 0o700);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&small, &link).unwrap();
+        fs::set_permissions(&small, fs::Permissions::from_mode(0o644)).unwrap();
+        make_private(&link).unwrap();
+        assert_eq!(mode(&small), 0o644);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pipe nobody writes to would hold an ordinary open for ever, and a device may never
+    /// end: neither is opened for reading, nor is a folder, nor a link to any of them.
+    #[test]
+    fn only_ordinary_files_are_read_and_none_without_end() {
+        use super::super::{read_limited, read_shared};
+        let dir = scratch("special");
+        let file = dir.join("file");
+        fs::write(&file, b"0123456789").unwrap();
+        assert_eq!(read_shared(&file).unwrap(), b"0123456789");
+        let link = dir.join("link-to-file");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(read_shared(&link).unwrap(), b"0123456789"); // a link to a file is the file
+        let pipe = dir.join("pipe");
+        fifo(&pipe);
+        let link_to_pipe = dir.join("link-to-pipe");
+        std::os::unix::fs::symlink(&pipe, &link_to_pipe).unwrap();
+        let link_to_device = dir.join("link-to-device");
+        std::os::unix::fs::symlink("/dev/zero", &link_to_device).unwrap();
+        let began = std::time::Instant::now();
+        for special in [
+            pipe.as_path(),
+            link_to_pipe.as_path(),
+            link_to_device.as_path(),
+            Path::new("/dev/zero"),
+            Path::new("/dev/null"),
+            dir.as_path(),
+        ] {
+            let refused = read_shared(special).unwrap_err();
+            assert_eq!(
+                refused.kind(),
+                io::ErrorKind::InvalidInput,
+                "{}",
+                special.display()
+            );
+            assert!(!stat(special).unwrap().is_file);
+        }
+        assert!(began.elapsed().as_secs() < 5); // (nothing was waited for)
+        assert!(stat(&file).unwrap().is_file && stat(&link).unwrap().is_file);
+        // a file larger than is to be read is not read to its end
+        assert_eq!(read_limited(&file, 10).unwrap().len(), 10);
+        assert!(read_limited(&file, 9).is_err());
+        assert!(read_limited(&file, 0).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

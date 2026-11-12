@@ -1,14 +1,14 @@
 //! The command line.
 
 use std::cell::RefCell;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use serde_json::Value;
 
-use crate::consts::VERSION;
+use crate::consts::{START_GRACE_SEC, VERSION};
 use crate::daemon::{acquire_lock, lock_for_daemon};
 use crate::history::journal_entries;
 #[cfg(windows)]
@@ -226,7 +226,8 @@ WHERE THINGS ARE
                                           the app's session lists (synced)
     ~/.claude/projects/                   transcripts (only looked at)
     ~/.config/systemd/user/claude-session-sync.service
-                                          starts the daemon at login
+                                          starts the daemon at login (it is put
+                                          where your systemd reads its units)
     ~/.local/bin/claude-session-sync      a link to the program
 
 ENVIRONMENT
@@ -234,8 +235,9 @@ ENVIRONMENT
     CLAUDE_SESSION_SYNC_STORE    The app's claude-code-sessions folder, if it
                                  is not found by itself
     CLAUDE_CONFIG_DIR            Claude Code's folder, if it is not ~/.claude
+    XDG_CONFIG_HOME              Where the app's own folder is, if not ~/.config
     Those that are set when install runs are written into the systemd unit,
-    so that the daemon looks in the same places. XDG_CONFIG_HOME is honoured.
+    so that the daemon looks in the same places.
 "
 );
 
@@ -497,11 +499,8 @@ impl Console {
 /// Append a line to sync.log without a `Sync` (for failures before one exists).
 fn log_line(paths: &Paths, msg: &str) {
     let _ = (|| -> io::Result<()> {
-        fs::create_dir_all(&paths.home)?;
-        let mut fh = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(paths.home.join("sync.log"))?;
+        winfs::make_dirs(&paths.home)?;
+        let mut fh = winfs::append_file(&paths.home.join("sync.log"))?;
         let stamp = winfs::local_format(winfs::real_now(), "%Y-%m-%d %H:%M:%S");
         fh.write_all(format!("{} {}\n", stamp, msg).as_bytes())
     })();
@@ -767,9 +766,24 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
         .map_or_else(|| String::from("?"), |v| shown(Some(v)));
     let beat = num(st.get("heartbeat")).filter(|b| *b != 0.0);
     let age = beat.map(|b| winfs::real_now() - b);
+    // Is the report that of the process that holds the lock now? A daemon puts the moment
+    // it took the lock on record (the lock file's time) and reports at once, so its report
+    // is never older than that; a report that is, was left by a daemon before it. (Whole
+    // seconds in the report, and a clock that was set meanwhile: two seconds' leave.)
+    let taken = winfs::stat(&home.join("daemon.lock"))
+        .ok()
+        .map(|lock| lock.mtime());
+    let reported = beat.is_some_and(|b| taken.is_none_or(|t| b >= t - 2.0));
+    let held_for = taken.map(|t| winfs::real_now() - t);
+    let starting =
+        running && !reported && held_for.is_none_or(|h| (-2.0..START_GRACE_SEC).contains(&h));
     // it reports every minute, whatever its settings
-    let stalled = running && age.is_some_and(|a| a > 660.0);
-    if running {
+    let stalled = running
+        && match reported {
+            true => age.is_some_and(|a| a > 660.0),
+            false => !starting,
+        };
+    if running && reported {
         // look with the eyes of the daemon that is at work
         s.delete_sync = truthy(st.get("delete_sync"));
         if let Some(days) = num(st.get("days")) {
@@ -779,7 +793,20 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
     let plan = s.plan();
 
     // the summary: one line that says whether all is well
-    let (word, daemon) = if stalled {
+    let (word, daemon) = if starting {
+        (
+            "STARTING",
+            String::from("a daemon has taken the lock and has not reported yet"),
+        )
+    } else if stalled && !reported {
+        (
+            "STALLED",
+            format!(
+                "the daemon has not reported since it started {} s ago",
+                held_for.unwrap_or(0.0) as i64
+            ),
+        )
+    } else if stalled {
         (
             "STALLED",
             format!(
@@ -798,12 +825,15 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
     } else {
         ("NOT RUNNING", String::from("no daemon"))
     };
-    let failed = if running {
+    // (what an earlier daemon reported is not this one's)
+    let failed = if running && reported {
         num(st.get("failed")).unwrap_or(0.0) as usize
     } else {
         0
     };
-    let errors = failed.max(usize::from(running && truthy(st.get("last_error"))));
+    let errors = failed.max(usize::from(
+        running && reported && truthy(st.get("last_error")),
+    ));
     con.say(&format!(
         "{}  {} | {} of {} sessions in every account | {} | {}",
         word,
@@ -833,7 +863,12 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
         con.say(&line);
     }
 
-    if running {
+    if running && !reported {
+        con.say(&format!(
+            "daemon: holds the lock{}, no report from it yet",
+            held_for.map_or_else(String::new, |h| format!(" (for {} s)", h as i64))
+        ));
+    } else if running {
         let pid = st
             .get("pid")
             .map_or_else(|| String::from("?"), |v| shown(Some(v)));
@@ -862,6 +897,7 @@ pub fn status(s: &mut Sync, con: &Console, sys: &mut dyn System, env: &Env) -> i
         when(st.get("last_change"))
     ));
     if running
+        && reported
         && ["waiting", "failed", "retrying", "last_error"]
             .iter()
             .any(|k| truthy(st.get(*k)))
@@ -1091,6 +1127,12 @@ fn execute(
                 _ => acquire_lock(&home),
             }
             .map_err(io_err)?;
+            // (macOS, Linux: what an earlier version left readable by everyone in this
+            // tool's folder becomes the user's alone when the daemon starts)
+            #[cfg(unix)]
+            if lock.is_some() && matches!(parsed.command, Command::Daemon { .. }) {
+                install::tighten(&home);
+            }
             let Some(lock) = lock else {
                 con.say(
                     "the daemon is running: it will pick changes up by itself. To undo, run \"claude-session-sync uninstall\" first.",

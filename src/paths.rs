@@ -34,6 +34,9 @@ pub struct Env {
     pub userprofile: Option<PathBuf>,
     /// `~/Library/Logs` (macOS only): the app's log is in its `Claude` folder.
     pub library_logs: Option<PathBuf>,
+    /// `XDG_CONFIG_HOME` as it is set (Linux only, and only a full path): `install` hands
+    /// it on to the daemon, which systemd would otherwise start without it.
+    pub xdg_config_home: Option<PathBuf>,
     /// `CLAUDE_CONFIG_DIR`: where Claude Code keeps `projects\` when it is not `~\.claude`.
     pub claude_config_dir: Option<PathBuf>,
     /// `CLAUDE_SESSION_SYNC_HOME`: this tool's state directory.
@@ -74,6 +77,7 @@ impl Env {
             localappdata: var("LOCALAPPDATA").map(PathBuf::from),
             userprofile: var("USERPROFILE").map(PathBuf::from),
             library_logs: None,
+            xdg_config_home: None,
             claude_config_dir: var("CLAUDE_CONFIG_DIR").map(PathBuf::from),
             home_override: var("CLAUDE_SESSION_SYNC_HOME").map(PathBuf::from),
             store_override: var("CLAUDE_SESSION_SYNC_STORE").map(PathBuf::from),
@@ -87,8 +91,15 @@ impl Env {
     pub fn from_process() -> Env {
         let var = Env::var;
         let home = var("HOME").map(PathBuf::from);
+        let xdg = match cfg!(target_os = "macos") {
+            true => None,
+            false => var("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|x| x.is_absolute()),
+        };
         Env {
-            appdata: Env::app_folders(home.as_deref(), var("XDG_CONFIG_HOME").map(PathBuf::from)),
+            appdata: Env::app_folders(home.as_deref(), xdg.clone()),
+            xdg_config_home: xdg,
             localappdata: None,
             library_logs: match cfg!(target_os = "macos") {
                 true => home.as_ref().map(|h| h.join("Library").join("Logs")),

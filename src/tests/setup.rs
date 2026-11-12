@@ -1368,9 +1368,10 @@ fn status_begins_with_a_one_line_summary() {
     assert!(
         cli(&b, &mut Recorder::installed(), &["status"]).1[0].ends_with("| 1 conflict | 2 errors")
     );
-    // it has not reported for a long time
+    // it has not reported for a long time (it took the lock before that, as a daemon does)
     let st = json!({"pid": 4242, "version": VERSION, "heartbeat": (now() - 2000.0) as i64});
     fs::write(b.home.join("status.json"), st.to_string()).unwrap();
+    set_mtime(&b.home.join("daemon.lock"), now() - 3000.0);
     let (code, out) = cli(&b, &mut Recorder::installed(), &["status"]);
     assert_eq!(code, 1);
     assert!(

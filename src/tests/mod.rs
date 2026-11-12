@@ -27,6 +27,7 @@ mod commands;
 mod compat;
 mod daemon;
 mod deletions;
+mod hardening;
 mod homes;
 mod last_moments;
 mod locations;
@@ -252,17 +253,12 @@ impl Base {
     /// that this item fails and nothing else does. What is in the way is returned: a folder,
     /// which can be removed again.
     ///
-    /// On Windows it is a folder where the record should be. Elsewhere such a folder is a
-    /// file this tool cannot read, which it leaves alone without trying; there the folder is
-    /// where the record is first written, under its temporary name.
+    /// The folder is where the record is first written, under its temporary name. (A folder
+    /// where the record itself should be is not a file, and so is left alone without a try:
+    /// see bad_input.)
     pub fn block(&self, leaf: Leaf, fid: &str) -> PathBuf {
-        #[cfg(windows)]
-        let in_the_way = self.path(leaf, fid);
-        #[cfg(unix)]
         let in_the_way = self.dir(leaf).join(format!(".sync-local_{}.json.tmp", fid));
         fs::create_dir_all(&in_the_way).unwrap();
-        #[cfg(windows)]
-        set_mtime(&in_the_way, now() - HOUR);
         in_the_way
     }
 

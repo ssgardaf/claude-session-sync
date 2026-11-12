@@ -21,7 +21,10 @@ use crate::consts::START_SLACK_SEC;
 #[path = "process_unix.rs"]
 mod unix;
 #[cfg(unix)]
-pub use unix::{desktop_app_running, is_desktop_app, processes, start_time, terminate};
+pub use unix::{
+    command_names_the_app, counts_as_ours, desktop_app_running, is_desktop_app, is_the_app,
+    lock_holder, processes, singleton_lock_live, start_time, terminate, this_user, Process,
+};
 
 /// `(pid, full path or None)` of the running processes whose file name is in `names`
 /// (lower case). None if the list could not be read.

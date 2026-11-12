@@ -16,7 +16,7 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Format
         run: cargo fmt --check
       - name: Lint
@@ -26,8 +26,9 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-  # What a release builds and the jobs above do not: the Intel half of the macOS program,
-  # and the static Linux program. Built here so that a tag does not find out first.
+  # What a release ships and the jobs above do not build: the Intel half of the macOS
+  # program, and the static Linux programs. Each is built and, where this runner can run it,
+  # put through the whole test suite, so that a tag does not find out first.
   release-targets:
     strategy:
       fail-fast: false
@@ -37,13 +38,37 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Rust, where the runner comes without it
+        shell: bash
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - name: Build for ${{ matrix.target }}
         run: |
           rustup target add ${{ matrix.target }}
           cargo build --release --locked --target ${{ matrix.target }}
+      # The static Linux programs run on the runner that built them.
+      - name: Test (musl)
+        if: runner.os == 'Linux'
+        run: cargo test --release --locked --target ${{ matrix.target }}
+      # The macOS runner is an Apple silicon machine: it runs the Intel half only through
+      # Rosetta. Where Rosetta is not installed, the Intel half is built and not run.
+      - name: Run and test the Intel half
+        if: runner.os == 'macOS'
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 target/${{ matrix.target }}/release/claude-session-sync --version
+            cargo test --release --locked --target ${{ matrix.target }}
+          else
+            echo "::notice::Rosetta is not installed on this runner: the Intel half was built, not run"
+          fi
 
   # The oldest Rust the README promises to build with.
   msrv:
@@ -53,7 +78,7 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust 1.88
         run: rustup toolchain install 1.88 --profile minimal
       - name: Build with Rust 1.88

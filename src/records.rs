@@ -345,6 +345,16 @@ impl Sync {
                             continue;
                         }
                     };
+                    if !st.is_file {
+                        // A folder, a pipe, a socket or a device under a record's name (or a
+                        // link to one): not a file, so not a record, and not this tool's to
+                        // read, mend or replace.
+                        bad.insert(
+                            fid.to_string(),
+                            (Why::Foreign, Some(st.mtime_ns), Some(st.size)),
+                        );
+                        continue;
+                    }
                     let p = e.path();
                     seen.insert(p.clone());
                     match self.read(&p, &st, fid) {

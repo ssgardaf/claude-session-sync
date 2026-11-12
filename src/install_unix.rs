@@ -4,16 +4,23 @@
 //! starts it again at once if it ends with an error, and within five minutes if it ended
 //! without one (`stop`).
 //!
-//! Linux: a systemd user unit in `~/.config/systemd/user`. systemd starts the daemon at
-//! login and starts it again a minute after it ends, however it ended. Where there is no
-//! systemd user session, nothing can start the daemon by itself: `install` says so and puts
-//! only the program in place.
+//! Linux: a systemd user unit, in the folder the user's systemd reads its units from
+//! (`~/.config/systemd/user` unless that systemd was started with another
+//! `XDG_CONFIG_HOME`). systemd starts the daemon at login and starts it again a minute after
+//! it ends, however it ended. Where there is no systemd user session, nothing can start the
+//! daemon by itself: `install` puts the program in place, says so, and leaves a note for
+//! `status` to say so too.
 //!
 //! Either way the program is copied to the `bin` folder of this tool's own folder and linked
-//! as `~/.local/bin/claude-session-sync`; no shell profile is touched. The three variables
-//! that say where things are (`CLAUDE_SESSION_SYNC_HOME`, `CLAUDE_SESSION_SYNC_STORE`,
-//! `CLAUDE_CONFIG_DIR`) are written into the agent or the unit if they are set when
-//! `install` runs, so that the daemon looks where the command line looked.
+//! as `~/.local/bin/claude-session-sync`; no shell profile is touched. The variables that
+//! say where things are (`CLAUDE_SESSION_SYNC_HOME`, `CLAUDE_SESSION_SYNC_STORE`,
+//! `CLAUDE_CONFIG_DIR`, and on Linux `XDG_CONFIG_HOME`) are written into the agent or the
+//! unit if they are set when `install` runs, so that the daemon looks where the command
+//! line looked.
+//!
+//! What is said is what was found, not what was meant: whether the daemon is loaded,
+//! enabled or running is asked of launchd or systemd itself, whatever files are or are not
+//! there, and "stopped" is only said once they agree.
 //!
 //! As on Windows, a daemon is only ever ended after it was asked to stop, and what starts it
 //! is taken away before it is stopped, so that nothing brings it back meanwhile.
@@ -30,16 +37,19 @@ use serde_json::Value;
 
 use super::{
     daemon_arguments, daemon_running, load_settings, save_settings, status_file, strs, xml_escape,
-    Autostart, Given, Settings, Setup, System, CONSOLE_EXE,
+    Autostart, Given, Settings, Setup, System, CONSOLE_EXE, OWN_DIRS, OWN_FILES,
 };
 use crate::consts::VERSION;
-use crate::paths::{Env, HOME_VAR};
+use crate::paths::{Env, Paths, HOME_VAR};
 use crate::winfs::{self, Expect};
 
 /// The name launchd knows the daemon by.
 pub const AGENT_LABEL: &str = "io.github.ssgardaf.claude-session-sync";
 /// The name systemd knows the daemon by.
 pub const UNIT_NAME: &str = "claude-session-sync.service";
+/// A note in this tool's folder: it was installed where nothing can start the daemon by
+/// itself (Linux without a systemd user session).
+pub const NO_AUTOSTART_FILE: &str = "no-autostart";
 
 /// What starts the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +76,14 @@ impl Manager {
         }
     }
 
+    /// What the daemon is to it, in two words.
+    fn kind(self) -> &'static str {
+        match self {
+            Manager::Launchd => "launch agent",
+            Manager::Systemd => "systemd user unit",
+        }
+    }
+
     /// The program it is asked through.
     fn tool(self) -> &'static str {
         match self {
@@ -75,19 +93,62 @@ impl Manager {
     }
 }
 
-/// The file that tells the manager about the daemon.
+/// The file that tells the manager about the daemon, where it is when nothing says
+/// otherwise: the agent's file, or the unit in `~/.config/systemd/user`. (Where the user's
+/// systemd really reads its units from is asked of it: see `located`.)
 pub fn service_file(manager: Manager, env: &Env) -> Option<PathBuf> {
-    match manager {
-        Manager::Launchd => env.userprofile.as_ref().map(|home| {
-            home.join("Library")
-                .join("LaunchAgents")
-                .join(format!("{}.plist", AGENT_LABEL))
-        }),
-        Manager::Systemd => env
-            .appdata
-            .as_ref()
-            .map(|config| config.join("systemd").join("user").join(UNIT_NAME)),
+    let home = env.userprofile.as_ref()?;
+    Some(match manager {
+        Manager::Launchd => home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", AGENT_LABEL)),
+        Manager::Systemd => home
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join(UNIT_NAME),
+    })
+}
+
+/// The folder a systemd user manager reads this user's own units from, out of its list of
+/// such folders (`systemctl --user show -p UnitPath --value`): the first that is called
+/// `.../systemd/user` and is neither the system's nor a passing one under `/run`.
+pub fn unit_dir_in(unit_path: &str) -> Option<PathBuf> {
+    unit_path
+        .split_whitespace()
+        .find(|dir| {
+            dir.ends_with("/systemd/user")
+                && !["/run/", "/etc/", "/usr/", "/lib/"]
+                    .iter()
+                    .any(|system| dir.starts_with(system))
+        })
+        .map(PathBuf::from)
+}
+
+/// What the user's systemd says of where it reads units from. None if it does not answer
+/// (there is no systemd user session).
+fn unit_path(sys: &mut dyn System) -> Option<String> {
+    match sys.run_output(
+        "systemctl",
+        &strs(&["--user", "show", "-p", "UnitPath", "--value"]),
+    ) {
+        Ok((0, listing)) if !listing.trim().is_empty() => Some(listing),
+        _ => None,
     }
+}
+
+/// The unit's file, given what systemd said of its folders (or did not say).
+fn unit_file(listing: Option<&str>, env: &Env) -> Option<PathBuf> {
+    listing
+        .and_then(unit_dir_in)
+        .map(|dir| dir.join(UNIT_NAME))
+        .or_else(|| service_file(Manager::Systemd, env))
+}
+
+/// The link systemd makes for an enabled unit, beside the unit's file.
+fn wants_link(unit: &Path) -> Option<PathBuf> {
+    Some(unit.parent()?.join("default.target.wants").join(UNIT_NAME))
 }
 
 /// Where the program is linked so that it can be called by its name.
@@ -97,13 +158,23 @@ pub fn link_file(env: &Env) -> Option<PathBuf> {
         .map(|home| home.join(".local").join("bin").join(CONSOLE_EXE))
 }
 
-/// The variables that say where things are, as far as they are set, with full paths.
-pub fn overrides(env: &Env) -> Vec<(&'static str, PathBuf)> {
+/// The variables that say where things are, as far as they are set, with full paths. On
+/// Linux that includes `XDG_CONFIG_HOME`, which says where the app's own folder is: a
+/// daemon started by systemd does not see what was set in the shell `install` ran in.
+pub fn overrides(env: &Env, manager: Manager) -> Vec<(&'static str, PathBuf)> {
     let full = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
+    let none = None;
     [
         ("CLAUDE_SESSION_SYNC_HOME", &env.home_override),
         ("CLAUDE_SESSION_SYNC_STORE", &env.store_override),
         ("CLAUDE_CONFIG_DIR", &env.claude_config_dir),
+        (
+            "XDG_CONFIG_HOME",
+            match manager {
+                Manager::Systemd => &env.xdg_config_home,
+                Manager::Launchd => &none,
+            },
+        ),
     ]
     .into_iter()
     .filter_map(|(name, value)| value.as_ref().map(|v| (name, full(v))))
@@ -160,15 +231,39 @@ pub fn agent_plist(program: &Path, arguments: &str, environment: &[(&str, PathBu
     lines.join("\n") + "\n"
 }
 
-/// A word for a unit file, in quotes, so that systemd reads it back as it is.
-fn unit_word(text: &str, dollar: bool) -> String {
+/// Why systemd cannot be given this program to start, if it cannot. It takes the program's
+/// path as it is written, between double quotes, with `%` doubled and nothing else changed
+/// (a `$` stands for itself there); a path with a quote of either kind, a backslash or a
+/// control character in it is refused by systemd however it is written ("Executable name
+/// contains special characters").
+pub fn unit_refusal(program: &Path) -> Option<String> {
+    let text = program.to_str()?;
+    let odd = |c: char| matches!(c, '"' | '\'' | '\\' | '\x7f') || c.is_control();
+    text.chars().any(odd).then(|| {
+        format!(
+            "systemd cannot start a program whose path has a quote, a backslash or a control character in it:\n  {}\n  \
+             Nothing was installed. Keep this tool's files in a folder without such characters (name it in \
+             CLAUDE_SESSION_SYNC_HOME) and run install again.",
+            text
+        )
+    })
+}
+
+/// The program's path as `ExecStart=` takes it (see `unit_refusal` for what it cannot take).
+fn unit_program(program: &Path) -> String {
+    format!("\"{}\"", program.to_string_lossy().replace('%', "%%"))
+}
+
+/// A setting for `Environment=`, in quotes, so that systemd reads it back as it is: there a
+/// backslash and a double quote are written with a backslash before them, `%` is doubled,
+/// and `$` stands for itself.
+fn unit_setting(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
-            '$' if dollar => out.push_str("$$"),
             other => out.push(other),
         }
     }
@@ -189,16 +284,12 @@ pub fn unit_text(program: &Path, arguments: &str, environment: &[(&str, PathBuf)
         String::new(),
         String::from("[Service]"),
         String::from("Type=simple"),
-        format!(
-            "ExecStart={} {}",
-            unit_word(&program.to_string_lossy(), true),
-            arguments
-        ),
+        format!("ExecStart={} {}", unit_program(program), arguments),
     ];
     for (name, value) in environment {
         lines.push(format!(
             "Environment={}",
-            unit_word(&format!("{}={}", name, value.to_string_lossy()), false)
+            unit_setting(&format!("{}={}", name, value.to_string_lossy()))
         ));
     }
     lines.extend(
@@ -235,6 +326,7 @@ fn agent_target(sys: &mut dyn System) -> String {
     format!("gui/{}/{}", sys.user_id(), AGENT_LABEL)
 }
 
+/// Does launchd have the agent loaded? None if it could not be asked.
 fn agent_loaded(sys: &mut dyn System) -> Option<bool> {
     let target = agent_target(sys);
     sys.run("launchctl", &strs(&["print", &target]))
@@ -248,30 +340,72 @@ fn agent_disabled(sys: &mut dyn System) -> bool {
         .is_ok_and(|(_, listing)| agent_is_disabled(&listing))
 }
 
-/// Ask the system how the daemon is started. Where the agent's or the unit's file is not
-/// there, nothing is asked: it is not installed.
-pub fn autostart(sys: &mut dyn System, env: &Env) -> Autostart {
-    let manager = sys.manager();
-    if !service_file(manager, env).is_some_and(|f| f.is_file()) {
-        return Autostart::NotInstalled;
+/// Have launchd let go of the agent (which ends its daemon), and wait until it has: it
+/// says so a moment before it is done. True if the agent is not loaded afterwards.
+fn agent_out(sys: &mut dyn System) -> bool {
+    let target = agent_target(sys);
+    let _ = sys.run("launchctl", &strs(&["bootout", &target]));
+    for _ in 0..10 {
+        if agent_loaded(sys) != Some(true) {
+            return true;
+        }
+        sys.sleep(0.5);
     }
-    match manager {
-        Manager::Launchd => match agent_loaded(sys) {
-            Some(true) => Autostart::Task { paused: false },
-            Some(false) if agent_disabled(sys) => Autostart::Task { paused: true },
-            Some(false) => Autostart::NotLoaded,
-            None => Autostart::Unknown,
-        },
+    false
+}
+
+/// One word from systemd about the unit (`is-enabled`, `is-active`); empty if it said
+/// nothing.
+fn unit_says(sys: &mut dyn System, question: &str) -> String {
+    sys.run_output("systemctl", &strs(&["--user", question, UNIT_NAME]))
+        .map(|(_, said)| said.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Is systemd running the unit, or about to?
+fn unit_active(sys: &mut dyn System) -> bool {
+    matches!(
+        unit_says(sys, "is-active").as_str(),
+        "active" | "activating" | "reloading"
+    )
+}
+
+/// Ask the system how the daemon is started. launchd and systemd are asked whatever files
+/// are there: a daemon they run without its file is reported as that, not as "not installed".
+pub fn autostart(sys: &mut dyn System, env: &Env) -> Autostart {
+    match sys.manager() {
+        Manager::Launchd => {
+            let file = service_file(Manager::Launchd, env).is_some_and(|f| f.is_file());
+            match agent_loaded(sys) {
+                None => Autostart::Unknown,
+                Some(true) if file => Autostart::Task { paused: false },
+                Some(true) => Autostart::NoFile,
+                Some(false) if !file => Autostart::NotInstalled,
+                Some(false) if agent_disabled(sys) => Autostart::Task { paused: true },
+                Some(false) => Autostart::NotLoaded,
+            }
+        }
         Manager::Systemd => {
-            match sys.run_output("systemctl", &strs(&["--user", "is-enabled", UNIT_NAME])) {
-                Ok((0, _)) => Autostart::Task { paused: false },
-                Ok((_, said)) => match said.trim() {
-                    "disabled" => Autostart::Task { paused: true },
-                    // nothing was said on standard output: the user's systemd did not answer
-                    "" => Autostart::NoManager,
-                    _ => Autostart::NotLoaded,
-                },
-                Err(_) => Autostart::NoManager,
+            let listing = unit_path(sys);
+            let file = unit_file(listing.as_deref(), env).is_some_and(|f| f.is_file());
+            if listing.is_none() {
+                // no user session of systemd: nothing starts the daemon here
+                let noted =
+                    Paths::discover(env).is_ok_and(|p| p.home.join(NO_AUTOSTART_FILE).exists());
+                return match file || noted {
+                    true => Autostart::NoManager,
+                    false => Autostart::NotInstalled,
+                };
+            }
+            let enabled = unit_says(sys, "is-enabled");
+            let active = unit_active(sys);
+            match (file, enabled.as_str(), active) {
+                (false, _, false) => Autostart::NotInstalled,
+                (false, _, true) => Autostart::NoFile,
+                (true, "enabled" | "enabled-runtime", _) => Autostart::Task { paused: false },
+                (true, "disabled", false) => Autostart::Task { paused: true },
+                // disabled by hand while it runs, masked, or something else not as installed
+                (true, _, _) => Autostart::NotLoaded,
             }
         }
     }
@@ -292,11 +426,15 @@ pub fn autostart_line(found: Autostart, manager: Manager) -> String {
             what
         ),
         Autostart::NotLoaded => format!(
-            "autostart: installed, but the {} is not active (run install again)",
+            "autostart: installed, but the {} is not in effect as it was installed (run install again)",
+            what
+        ),
+        Autostart::NoFile => format!(
+            "autostart: the {} is active, but its file is missing (run install again)",
             what
         ),
         Autostart::NoManager => String::from(
-            "autostart: none (no systemd user session here; the daemon runs only if you start it: claude-session-sync daemon)",
+            "autostart: not available here (no systemd user session); the daemon runs only while you run it: claude-session-sync daemon",
         ),
         Autostart::Unknown => format!("autostart: unknown ({} could not be asked)", manager.tool()),
         Autostart::NotInstalled | Autostart::StartupEntry | Autostart::NoTaskSeen => {
@@ -322,9 +460,55 @@ fn writable(path: &Path) -> Result<(), String> {
     match path.to_str() {
         Some(text) if !text.chars().any(char::is_control) => Ok(()),
         _ => Err(format!(
-            "{} cannot be written into the daemon's start-up definition (it is not plain text)",
+            "{} cannot be written into the daemon's start-up definition (it is not plain text). Nothing was installed.",
             path.display()
         )),
+    }
+}
+
+/// Everything below a folder of this tool's own becomes the user's alone. Links are neither
+/// followed nor changed.
+fn tighten_tree(dir: &Path) {
+    let _ = winfs::make_private(dir);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => tighten_tree(&entry.path()),
+            Ok(kind) if kind.is_file() => {
+                let _ = winfs::make_private(&entry.path());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Make this tool's own folder, and what this tool keeps in it, the user's alone: folders
+/// 0700, files 0600 (the program stays a program). An install made by an earlier version
+/// left them readable by everyone; this is run when the daemon starts and at every install.
+/// Only what is this tool's own is touched, should the folder hold more.
+pub fn tighten(home: &Path) {
+    if !fs::symlink_metadata(home).is_ok_and(|found| found.is_dir()) {
+        return;
+    }
+    let _ = winfs::make_private(home);
+    for name in OWN_FILES {
+        let _ = winfs::make_private(&home.join(name));
+    }
+    for name in OWN_DIRS.iter().chain(&["bin"]) {
+        let dir = home.join(name);
+        if fs::symlink_metadata(&dir).is_ok_and(|found| found.is_dir()) {
+            tighten_tree(&dir);
+        }
+    }
+    if let Ok(entries) = fs::read_dir(home) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".sync-") && name.ends_with(".tmp") {
+                let _ = winfs::make_private(&entry.path());
+            }
+        }
     }
 }
 
@@ -398,11 +582,38 @@ impl Setup<'_> {
         code
     }
 
-    /// Is there a user session of systemd to hand the unit to?
-    fn systemd_answers(&mut self) -> bool {
-        self.sys
-            .run("systemctl", &strs(&["--user", "show-environment"]))
-            .is_ok_and(|code| code == 0)
+    fn systemctl(&mut self, args: &[&str]) -> i32 {
+        let mut all = vec!["--user"];
+        all.extend_from_slice(args);
+        self.sys.run("systemctl", &strs(&all)).unwrap_or(-1)
+    }
+
+    /// Take the unit away from systemd, whatever state it is in: stopped (so that systemd
+    /// does not start the daemon again), disabled, its file removed or put back as it was
+    /// before (`restore`), and the link systemd made for it removed if that is left over.
+    /// True if systemd is not running it afterwards and nothing is left enabled.
+    fn unit_out(&mut self, unit: &Path, restore: Option<&[u8]>) -> bool {
+        let _ = self.systemctl(&["stop", UNIT_NAME]);
+        let _ = self.systemctl(&["disable", UNIT_NAME]);
+        match restore {
+            Some(before) => {
+                let _ = fs::write(unit, before);
+            }
+            None => {
+                let _ = fs::remove_file(unit);
+            }
+        }
+        if let Some(link) = wants_link(unit) {
+            // (left dangling when the unit's file was removed before it was disabled)
+            if fs::symlink_metadata(&link).is_ok_and(|found| found.file_type().is_symlink()) {
+                let _ = fs::remove_file(&link);
+            }
+        }
+        let _ = self.systemctl(&["daemon-reload"]);
+        let _ = self.systemctl(&["reset-failed", UNIT_NAME]);
+        !unit_active(self.sys)
+            && !wants_link(unit).is_some_and(|l| fs::symlink_metadata(l).is_ok())
+            && (restore.is_some() || !unit.exists())
     }
 
     /// The pid of the daemon on record, for telling the user what to end.
@@ -410,6 +621,25 @@ impl Setup<'_> {
         status_file(&self.paths.home)
             .and_then(|st| st.get("pid").and_then(Value::as_u64))
             .map_or_else(|| String::from("<its pid>"), |pid| pid.to_string())
+    }
+
+    /// Where to look when the daemon did not come up.
+    fn where_to_look(&self, manager: Manager) -> String {
+        let log = self.paths.home.join("sync.log");
+        let mut places = Vec::new();
+        if manager == Manager::Systemd {
+            places.push(format!(
+                "systemctl --user status {}",
+                UNIT_NAME.trim_end_matches(".service")
+            ));
+        }
+        if log.exists() {
+            places.push(log.display().to_string());
+        }
+        if places.is_empty() {
+            places.push(format!("{} (not written yet)", log.display()));
+        }
+        places.join("\n            ")
     }
 
     /// Register the daemon so it starts by itself and is started again if it ever stops, and
@@ -421,17 +651,22 @@ impl Setup<'_> {
         let home = self.paths.home.clone();
         let bin = home.join("bin");
         let program = bin.join(CONSOLE_EXE);
-        let service = service_file(manager, self.env).ok_or(format!("{} is not set", HOME_VAR))?;
         if !self.current_exe.is_file() {
             return Err(format!(
                 "cannot tell where this program is ({} is not a file)",
                 self.current_exe.display()
             ));
         }
-        let environment = overrides(self.env);
+        // What cannot be written into the agent or the unit is said before anything is changed.
+        let environment = overrides(self.env, manager);
         writable(&program)?;
         for (_, value) in &environment {
             writable(value)?;
+        }
+        if manager == Manager::Systemd {
+            if let Some(why) = unit_refusal(&program) {
+                return Err(why);
+            }
         }
 
         // The settings: what is given now, over what the previous install was given.
@@ -445,40 +680,49 @@ impl Setup<'_> {
         };
         let arguments = daemon_arguments(settings);
 
-        // Without a user session of systemd nothing here can start the daemon by itself.
-        let managed = manager == Manager::Launchd || self.systemd_answers();
+        // Where the definition goes. Without a user session of systemd nothing here can start
+        // the daemon by itself, and there is nowhere for a unit to go.
+        let listing = match manager {
+            Manager::Systemd => unit_path(self.sys),
+            Manager::Launchd => None,
+        };
+        let managed = manager == Manager::Launchd || listing.is_some();
+        let service = match manager {
+            Manager::Launchd => service_file(manager, self.env),
+            Manager::Systemd => unit_file(listing.as_deref(), self.env),
+        }
+        .ok_or(format!("{} is not set", HOME_VAR))?;
 
         // A daemon that is already running keeps the old program and settings. Ask it to finish
         // what it is doing and exit; then take it out of the manager's hands, which also ends
-        // one that did not answer, and keeps it from being started again meanwhile.
+        // one that did not answer, and keeps it from being started again meanwhile. The manager
+        // is asked whether it has the daemon: its file may be gone while it runs.
         let stopped = self.stop().map_err(|e| e.to_string())?;
-        if service.is_file() {
-            match manager {
-                Manager::Launchd => {
-                    let target = agent_target(self.sys);
-                    let _ = self.sys.run("launchctl", &strs(&["bootout", &target]));
+        match manager {
+            Manager::Launchd => {
+                if agent_loaded(self.sys) == Some(true) {
+                    agent_out(self.sys);
                 }
-                Manager::Systemd if managed => {
-                    let _ = self
-                        .sys
-                        .run("systemctl", &strs(&["--user", "stop", UNIT_NAME]));
-                }
-                Manager::Systemd => {}
             }
-            if !stopped {
-                self.sys.sleep(2.0);
+            Manager::Systemd if managed => {
+                let _ = self.systemctl(&["stop", UNIT_NAME]);
             }
+            Manager::Systemd => {}
+        }
+        if !stopped {
+            self.sys.sleep(2.0);
         }
 
         // The program: written beside the old one and put in its place in one step, so that
         // a copy that is still running is not written into.
+        winfs::make_dirs(&home).map_err(|e| format!("cannot create {}: {}", home.display(), e))?;
         if !same_file(&self.current_exe, &program) {
-            fs::create_dir_all(&bin)
+            winfs::make_dirs(&bin)
                 .map_err(|e| format!("cannot create {}: {}", bin.display(), e))?;
             let staged = bin.join(format!(".{}.new", CONSOLE_EXE));
             let copied = fs::read(&self.current_exe)
-                .and_then(|bytes| fs::write(&staged, bytes))
-                .and_then(|()| fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)))
+                .and_then(|bytes| winfs::write_file(&staged, &bytes))
+                .and_then(|()| fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)))
                 .and_then(|()| fs::rename(&staged, &program));
             if let Err(e) = copied {
                 let _ = fs::remove_file(&staged);
@@ -489,8 +733,11 @@ impl Setup<'_> {
                 ));
             }
         }
+        // (what an earlier version left readable by everyone is the user's alone from now on)
+        tighten(&home);
 
         let mut not_started: Option<String> = None;
+        let before = fs::read(&service).ok();
         if managed {
             let text = match manager {
                 Manager::Launchd => agent_plist(&program, &arguments, &environment),
@@ -500,7 +747,10 @@ impl Setup<'_> {
                 fs::create_dir_all(dir)
                     .map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
             }
+            // (launchd and systemd want their files readable; nothing in them is private)
             winfs::atomic_write(&service, text.as_bytes(), None, true, Expect::Any)
+                .map_err(|e| format!("cannot write {}: {}", service.display(), e))?;
+            fs::set_permissions(&service, fs::Permissions::from_mode(0o644))
                 .map_err(|e| format!("cannot write {}: {}", service.display(), e))?;
             match manager {
                 Manager::Launchd => {
@@ -521,19 +771,16 @@ impl Setup<'_> {
                     }
                 }
                 Manager::Systemd => {
-                    let _ = self
-                        .sys
-                        .run("systemctl", &strs(&["--user", "daemon-reload"]));
-                    let enabled = self.sys.run(
-                        "systemctl",
-                        &strs(&["--user", "enable", "--now", UNIT_NAME]),
-                    );
-                    if !enabled.as_ref().is_ok_and(|c| *c == 0) {
+                    let _ = self.systemctl(&["daemon-reload"]);
+                    let code = self.systemctl(&["enable", "--now", UNIT_NAME]);
+                    if code != 0 {
+                        // nothing that does not start is left enabled
+                        self.unit_out(&service, before.as_deref());
                         not_started = Some(format!(
-                            "systemd did not take the unit (systemctl --user enable --now exit code {}).\n  \
-                             Look at:  systemctl --user status {}",
-                            enabled.unwrap_or(-1),
-                            UNIT_NAME
+                            "systemd did not take the unit (systemctl --user enable --now exit code {}); it was \
+                             taken out again.\n  Look at:  systemctl --user status {}",
+                            code,
+                            UNIT_NAME.trim_end_matches(".service")
                         ));
                     }
                 }
@@ -542,26 +789,69 @@ impl Setup<'_> {
 
         let saved = save_settings(&home, settings);
         let linked = self.link(&program);
-        let link_dir = link_file(self.env).and_then(|l| l.parent().map(Path::to_path_buf));
+        let link = link_file(self.env).unwrap_or_default();
         let callable = linked.is_ok()
-            && link_dir
-                .as_ref()
+            && link
+                .parent()
                 .is_some_and(|dir| on_path(self.env.path.as_deref(), dir));
+        let name = self.program(callable);
+        let path_lines = |made: &Result<bool, String>| -> Vec<String> {
+            match made {
+                Ok(made) if callable => vec![format!(
+                    "  PATH       {} {}",
+                    if *made {
+                        "linked as"
+                    } else {
+                        "already linked as"
+                    },
+                    link.display()
+                )],
+                Ok(_) => vec![
+                    format!("  PATH       linked as {}", link.display()),
+                    String::from(
+                        "             (that folder is not on your PATH: add it, or call the program by its full path, as below)",
+                    ),
+                ],
+                Err(why) => vec![format!(
+                    "  PATH       not linked ({}): call the program by its full path, as below",
+                    why
+                )],
+            }
+        };
 
+        let note = home.join(NO_AUTOSTART_FILE);
         if !managed {
-            return Err(format!(
-                "the program is in place, but nothing here can start the daemon by itself: there is no systemd \
-                 user session (systemctl --user did not answer).\n  \
-                 Program:  {}\n  \
-                 To sync, start the daemon yourself, for example from your desktop's autostart:\n      \
-                 {} {}\n  \
-                 A single pass:  {} sync",
-                program.display(),
-                self.program(callable),
-                arguments,
-                self.program(callable)
-            ));
+            // The program is in place, and that is all that can be done here: said plainly,
+            // and put on record for `status` to say so too.
+            let _ = winfs::write_file(
+                &note,
+                b"installed where nothing can start the daemon by itself: no systemd user session\n",
+            );
+            self.tell(
+                "Installed, but NOT to start by itself: there is no systemd user session here",
+            );
+            self.tell(
+                "(systemctl --user did not answer), and nothing else this tool knows of starts a",
+            );
+            self.tell("program at login.");
+            self.tell("");
+            self.tell(&format!("  Program    {}", program.display()));
+            self.tell(&format!("  Data       {}", home.display()));
+            for line in path_lines(&linked) {
+                self.tell(&line);
+            }
+            self.tell("");
+            self.tell(
+                "To sync, run the daemon yourself, for example from your desktop's autostart:",
+            );
+            self.tell(&format!("  {} {}", name, arguments));
+            self.tell("or make a single pass whenever you like:");
+            self.tell(&format!("  {} sync", name));
+            self.tell("");
+            self.tell("Run install again once a systemd user session is there.");
+            return Ok(());
         }
+        let _ = fs::remove_file(&note);
         if let Some(why) = not_started {
             return Err(format!(
                 "the program is in place, but the daemon was not started: {}",
@@ -572,15 +862,22 @@ impl Setup<'_> {
         // Do not report success unless THIS version really came up (a crash at start leaves
         // nothing else to see, and an old daemon that would not stop must not pass for the new one).
         let Some(pid) = self.wait_for_daemon(began, true) else {
+            let look = self.where_to_look(manager);
+            let undone = match manager {
+                Manager::Systemd => {
+                    // (systemd would go on trying once a minute for ever)
+                    self.unit_out(&service, before.as_deref());
+                    " The unit was taken out again, so that nothing that does not start is left enabled."
+                }
+                Manager::Launchd => "",
+            };
             return Err(format!(
-                "the program was copied and the autostart was set up, but the new daemon did not come up.\n  \
+                "the program was copied and the autostart was set up, but the new daemon did not come up.{}\n  \
                  Look at:  {}\n  Then:     {} status",
-                home.join("sync.log").display(),
-                self.program(callable)
+                undone, look, name
             ));
         };
 
-        let name = self.program(callable);
         self.tell("Installed. From now on the session list is kept the same under every account.");
         self.tell("");
         self.tell(&format!(
@@ -631,25 +928,8 @@ impl Setup<'_> {
             "  Data       {}   (what it does: sync.log)",
             home.display()
         ));
-        let link = link_file(self.env).unwrap_or_default();
-        match &linked {
-            Ok(made) if callable => self.tell(&format!(
-                "  PATH       {} {}",
-                if *made {
-                    "linked as"
-                } else {
-                    "already linked as"
-                },
-                link.display()
-            )),
-            Ok(_) => {
-                self.tell(&format!("  PATH       linked as {}", link.display()));
-                self.tell("             (that folder is not on your PATH: add it, or call the program by its full path, as below)");
-            }
-            Err(why) => self.tell(&format!(
-                "  PATH       not linked ({}): call the program by its full path, as below",
-                why
-            )),
+        for line in path_lines(&linked) {
+            self.tell(&line);
         }
         if !environment.is_empty() {
             let names: Vec<&str> = environment.iter().map(|(name, _)| *name).collect();
@@ -701,66 +981,66 @@ impl Setup<'_> {
         let home = self.paths.home.clone();
         let bin = home.join("bin");
         let program = bin.join(CONSOLE_EXE);
-        let service = service_file(manager, self.env);
         let label = |what: &str| format!("  {:<52}  ", what);
         let mut name = manager.what();
         name[..1].make_ascii_uppercase();
 
-        // Unregister first, so that nothing brings the daemon back while it is stopping.
-        let had_file = service.as_ref().is_some_and(|f| f.is_file());
-        let mut gone = true;
-        let mut was_registered = had_file;
-        match manager {
+        // Unregister first, so that nothing brings the daemon back while it is stopping. What
+        // launchd or systemd has is asked of them, whatever files are there or are not: a
+        // daemon whose file was deleted while it runs is still theirs to start again.
+        let (was_there, gone, seen) = match manager {
             Manager::Launchd => {
-                let target = agent_target(self.sys);
-                if agent_loaded(self.sys) == Some(true) {
-                    was_registered = true;
-                    let _ = self.sys.run("launchctl", &strs(&["bootout", &target]));
-                    // (it lets go of the agent a moment after it says so)
-                    for _ in 0..10 {
-                        if agent_loaded(self.sys) != Some(true) {
-                            break;
-                        }
-                        self.sys.sleep(0.5);
-                    }
-                    gone = agent_loaded(self.sys) != Some(true);
-                }
+                let file = service_file(manager, self.env).filter(|f| f.is_file());
+                let loaded = agent_loaded(self.sys) == Some(true);
+                let out = !loaded || agent_out(self.sys);
                 // A pause is kept in launchd's own records, by name: without this, an agent
                 // installed later under the same name would stay disabled.
-                if was_registered && agent_disabled(self.sys) {
+                if (loaded || file.is_some()) && agent_disabled(self.sys) {
+                    let target = agent_target(self.sys);
                     let _ = self.sys.run("launchctl", &strs(&["enable", &target]));
                 }
+                let removed = file.as_ref().is_none_or(|f| fs::remove_file(f).is_ok());
+                (loaded || file.is_some(), out && removed, file)
             }
             Manager::Systemd => {
-                if had_file {
-                    let disabled = self.sys.run(
-                        "systemctl",
-                        &strs(&["--user", "disable", "--now", UNIT_NAME]),
-                    );
-                    // (where no systemd answers, nothing is running under it either)
-                    gone = disabled.is_ok_and(|c| c == 0) || !self.systemd_answers();
-                }
+                let listing = unit_path(self.sys);
+                let unit = unit_file(listing.as_deref(), self.env);
+                let file = unit.clone().filter(|f| f.is_file());
+                let enabled_link = unit
+                    .as_deref()
+                    .and_then(wants_link)
+                    .is_some_and(|l| fs::symlink_metadata(l).is_ok());
+                let active = listing.is_some() && unit_active(self.sys);
+                let was_there = file.is_some() || enabled_link || active;
+                let gone = match (&unit, listing.is_some()) {
+                    (Some(unit), true) if was_there => self.unit_out(unit, None),
+                    // (where no systemd answers, nothing runs under it: only the file can be there)
+                    (Some(unit), false) => !unit.exists() || fs::remove_file(unit).is_ok(),
+                    _ => true,
+                };
+                (was_there, gone, file)
             }
-        }
-        if let Some(file) = service.as_ref().filter(|_| had_file) {
-            gone = fs::remove_file(file).is_ok() && gone;
-            if manager == Manager::Systemd {
-                let _ = self
-                    .sys
-                    .run("systemctl", &strs(&["--user", "daemon-reload"]));
-            }
-        }
-        if !was_registered {
+        };
+        let _ = fs::remove_file(home.join(NO_AUTOSTART_FILE));
+        if !was_there {
             self.tell(&format!("{}was not installed", label(&name)));
         } else if gone {
             self.tell(&format!("{}removed", label(&name)));
         } else {
+            let look = match (manager, &seen) {
+                (Manager::Systemd, _) => format!(
+                    "systemctl --user status {}",
+                    UNIT_NAME.trim_end_matches(".service")
+                ),
+                (Manager::Launchd, Some(file)) => file.display().to_string(),
+                (Manager::Launchd, None) => {
+                    format!("launchctl print {}", agent_target(self.sys))
+                }
+            };
             self.tell(&format!(
-                "{}could NOT be removed{}",
+                "{}could NOT be removed: see  {}",
                 label(&name),
-                service
-                    .as_ref()
-                    .map_or_else(String::new, |f| format!(": see {}", f.display()))
+                look
             ));
         }
 
@@ -779,7 +1059,13 @@ impl Setup<'_> {
         }
 
         let mut stopped = self.stop().map_err(|e| e.to_string())?;
-        if stopped {
+        if stopped && was_there && !gone {
+            // (what could not be taken away from launchd or systemd may be started by it again)
+            self.tell(&format!(
+                "{}stopped for now, but may be started again (see above)",
+                label("Daemon")
+            ));
+        } else if stopped {
             self.tell(&format!("{}not running any more", label("Daemon")));
         } else {
             // It did not answer the request (it may be stuck, and nothing looks after it now):
@@ -860,35 +1146,13 @@ impl Setup<'_> {
     }
 
     /// Stop syncing until `resume`: the agent or the unit is disabled first, so that nothing
-    /// starts the daemon again, and then the daemon is stopped.
+    /// starts the daemon again, and then the daemon is stopped. That it is stopped is only
+    /// said once launchd or systemd says so too.
     pub fn pause(&mut self) -> Result<(), String> {
         let manager = self.sys.manager();
         let what = manager.what();
-        match autostart(self.sys, self.env) {
-            Autostart::Task { paused: true } => self.tell(&format!("The {} is paused already.", what)),
-            Autostart::Task { paused: false } | Autostart::NotLoaded => {
-                let disabled = match manager {
-                    Manager::Launchd => {
-                        let target = agent_target(self.sys);
-                        let disabled = self.sys.run("launchctl", &strs(&["disable", &target]));
-                        if disabled.as_ref().is_ok_and(|c| *c == 0) {
-                            // (this ends the daemon, by asking it to; nothing to unload is no error)
-                            let _ = self.sys.run("launchctl", &strs(&["bootout", &target]));
-                        }
-                        disabled
-                    }
-                    Manager::Systemd => self.sys.run(
-                        "systemctl",
-                        &strs(&["--user", "disable", "--now", UNIT_NAME]),
-                    ),
-                };
-                if !disabled.is_ok_and(|c| c == 0) {
-                    return Err(format!(
-                        "the {} could not be disabled; nothing was changed",
-                        what
-                    ));
-                }
-            }
+        let found = autostart(self.sys, self.env);
+        match found {
             Autostart::NoManager => {
                 return Err(String::from(
                     "there is no systemd user session here, so nothing starts the daemon by itself and there is \
@@ -900,12 +1164,45 @@ impl Setup<'_> {
                 return Err(format!(
                     "not installed: there is no {} to pause.\n  \
                      A daemon you started yourself is stopped with:  claude-session-sync stop",
-                    match manager {
-                        Manager::Launchd => "launch agent",
-                        Manager::Systemd => "systemd user unit",
-                    }
+                    manager.kind()
                 ))
             }
+            Autostart::Task { paused: true } => {
+                self.tell(&format!("The {} is paused already.", what))
+            }
+            Autostart::Task { paused: false } | Autostart::NotLoaded | Autostart::NoFile => {}
+        }
+        // Whatever was found, the manager is told to let go of the daemon: one that was
+        // disabled by hand may still be running under it, and would be started again.
+        let let_go = match manager {
+            Manager::Launchd => {
+                let target = agent_target(self.sys);
+                let disabled = found == (Autostart::Task { paused: true })
+                    || self
+                        .sys
+                        .run("launchctl", &strs(&["disable", &target]))
+                        .is_ok_and(|c| c == 0);
+                // (this ends the daemon, by asking it to)
+                disabled && (agent_loaded(self.sys) != Some(true) || agent_out(self.sys))
+            }
+            Manager::Systemd => {
+                let disabled = self.systemctl(&["disable", "--now", UNIT_NAME]) == 0
+                    || !matches!(
+                        unit_says(self.sys, "is-enabled").as_str(),
+                        "enabled" | "enabled-runtime"
+                    );
+                // (without its file the unit cannot be disabled, but it can be stopped)
+                disabled && {
+                    let _ = self.systemctl(&["stop", UNIT_NAME]);
+                    !unit_active(self.sys)
+                }
+            }
+        };
+        if !let_go {
+            return Err(format!(
+                "the {} could not be disabled; nothing else was changed",
+                what
+            ));
         }
         let mut stopped = self.stop().map_err(|e| e.to_string())?;
         if !stopped {
@@ -934,6 +1231,13 @@ impl Setup<'_> {
         let found = autostart(self.sys, self.env);
         match found {
             Autostart::Task { .. } | Autostart::NotLoaded => {}
+            Autostart::NoFile => {
+                return Err(format!(
+                    "the {}'s file is missing, so it cannot be started again.\n  \
+                     To put it back:  claude-session-sync install",
+                    manager.kind()
+                ))
+            }
             Autostart::NoManager => {
                 return Err(String::from(
                     "there is no systemd user session here, so nothing starts the daemon by itself.\n  \
@@ -944,10 +1248,7 @@ impl Setup<'_> {
             Autostart::NotInstalled | Autostart::StartupEntry | Autostart::NoTaskSeen => {
                 return Err(format!(
                     "not installed: there is no {} to resume.\n  To install:  claude-session-sync install",
-                    match manager {
-                        Manager::Launchd => "launch agent",
-                        Manager::Systemd => "systemd user unit",
-                    }
+                    manager.kind()
                 ))
             }
         }
@@ -973,13 +1274,7 @@ impl Setup<'_> {
                     self.load_agent(&file)
                 }
             }
-            Manager::Systemd => self
-                .sys
-                .run(
-                    "systemctl",
-                    &strs(&["--user", "enable", "--now", UNIT_NAME]),
-                )
-                .unwrap_or(-1),
+            Manager::Systemd => self.systemctl(&["enable", "--now", UNIT_NAME]),
         };
         if started != 0 {
             return Err(format!(
@@ -1000,7 +1295,7 @@ impl Setup<'_> {
             None => Err(format!(
                 "the {} is enabled again, but the daemon has not come up yet.\n  Look at:  {}",
                 what,
-                self.paths.home.join("sync.log").display()
+                self.where_to_look(manager)
             )),
         }
     }

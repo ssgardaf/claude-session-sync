@@ -5,9 +5,7 @@
 //! The module has its name from the first, Windows-only versions. What differs by system is
 //! here for Windows and in `unixfs.rs` for macOS and Linux, under the same names.
 
-use std::fs::{self, DirEntry};
-#[cfg(windows)]
-use std::fs::{File, OpenOptions};
+use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -34,12 +32,14 @@ use windows_sys::Win32::System::Time::{
 #[path = "unixfs.rs"]
 mod unix;
 #[cfg(unix)]
-use unix::{create, from_metadata};
+use unix::from_metadata;
 #[cfg(unix)]
 pub use unix::{
-    disk_free, local_fields, local_to_epoch, norm, open_shared, rename_noreplace, replace,
-    set_times,
+    disk_free, local_fields, local_to_epoch, make_dirs, make_private, norm, open_own, open_shared,
+    rename_noreplace, replace, set_times,
 };
+
+use crate::consts::MAX_READ_BYTES;
 
 #[cfg(windows)]
 const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000; // 1601 -> 1970, in 100 ns steps
@@ -62,6 +62,8 @@ pub struct Stat {
     pub atime_ns: i64,
     pub size: u64,
     pub is_dir: bool,
+    /// An ordinary file: not a folder, and not a pipe, a socket or a device either.
+    pub is_file: bool,
 }
 
 impl Stat {
@@ -89,6 +91,7 @@ fn from_metadata(md: &fs::Metadata) -> Stat {
         atime_ns: filetime_to_ns(md.last_access_time()),
         size: md.file_size(),
         is_dir: md.is_dir(),
+        is_file: md.is_file(),
     }
 }
 
@@ -134,11 +137,69 @@ pub fn open_shared(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-pub fn read_shared(path: &Path) -> io::Result<Vec<u8>> {
-    let mut fh = open_shared(path)?;
+/// The whole of a file (opened as `open_shared` opens it), if it is no larger than `max`
+/// bytes: one that is, is an error, and is not read to its end.
+pub fn read_limited(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let fh = open_shared(path)?;
     let mut data = Vec::new();
-    fh.read_to_end(&mut data)?;
+    fh.take(max.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        return Err(io::Error::other(format!(
+            "larger than {} bytes: not read",
+            max
+        )));
+    }
     Ok(data)
+}
+
+/// The whole of a file. Nothing this tool reads is anywhere near `MAX_READ_BYTES`.
+pub fn read_shared(path: &Path) -> io::Result<Vec<u8>> {
+    read_limited(path, MAX_READ_BYTES)
+}
+
+/// Open one of this tool's own files, or a file it puts in the store, with the options
+/// given. On macOS and Linux a file that is made by that is the user's alone (mode 0600),
+/// whatever the process's umask, and one that was there with a wider mode is narrowed.
+#[cfg(windows)]
+pub fn open_own(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    options.open(path)
+}
+
+/// A new, empty file for writing (whatever was there is emptied).
+pub fn create_file(path: &Path) -> io::Result<File> {
+    open_own(
+        OpenOptions::new().write(true).create(true).truncate(true),
+        path,
+    )
+}
+
+/// A new file for writing. It is an error (`AlreadyExists`) if anything is there.
+pub fn create_new_file(path: &Path) -> io::Result<File> {
+    open_own(OpenOptions::new().write(true).create_new(true), path)
+}
+
+/// A file to add lines to, made if it is not there.
+pub fn append_file(path: &Path) -> io::Result<File> {
+    open_own(OpenOptions::new().append(true).create(true), path)
+}
+
+/// Write a small file of this tool's own in one go.
+pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    create_file(path)?.write_all(data)
+}
+
+/// Make a folder of this tool's own, and the folders above it that are missing. On macOS
+/// and Linux the folders made are the user's alone (mode 0700).
+#[cfg(windows)]
+pub fn make_dirs(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+/// Make a file or folder that was moved into this tool's own folders the user's alone
+/// (macOS and Linux; on Windows there is nothing to do).
+#[cfg(windows)]
+pub fn make_private(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -217,12 +278,29 @@ pub fn replace(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Move a file: a rename where that works, otherwise (another volume) copy and remove.
+/// Move a file. It never replaces: if anything is at `dst`, that is an error
+/// (`AlreadyExists`) and both are left as they are. A rename where that works; only where
+/// the two places are on different volumes, a copy that keeps the file's times, after which
+/// the original is removed. Any other error is returned.
 pub fn move_file(src: &Path, dst: &Path) -> io::Result<()> {
-    if rename_noreplace(src, dst).is_ok() {
-        return Ok(());
+    match rename_noreplace(src, dst) {
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => copy_then_remove(src, dst),
+        other => other,
     }
-    fs::copy(src, dst)?;
+}
+
+/// The move across volumes: the copy is made as a new file (never over one that is there),
+/// is given the original's times, and only then is the original removed.
+pub(crate) fn copy_then_remove(src: &Path, dst: &Path) -> io::Result<()> {
+    let st = stat(src)?;
+    let data = read_shared(src)?;
+    let mut fh = create_new_file(dst)?;
+    let written = fh.write_all(&data).and_then(|()| fh.sync_all());
+    drop(fh);
+    if let Err(e) = written.and_then(|()| set_times(dst, st.atime_ns, st.mtime_ns)) {
+        let _ = fs::remove_file(dst); // (the copy this call made, and did not finish)
+        return Err(e);
+    }
     fs::remove_file(src)
 }
 
@@ -259,12 +337,6 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-/// A new, empty file for writing (on Windows: whatever was there is emptied).
-#[cfg(windows)]
-fn create(path: &Path) -> io::Result<File> {
-    File::create(path)
-}
-
 fn temp_name(path: &Path) -> PathBuf {
     let base = path
         .file_name()
@@ -284,7 +356,7 @@ pub fn atomic_write(
     let tmp = temp_name(path);
     let result = (|| -> Result<(), WriteError> {
         {
-            let mut fh = create(&tmp)?;
+            let mut fh = create_file(&tmp)?;
             fh.write_all(data)?;
             if fsync {
                 fh.flush()?;
